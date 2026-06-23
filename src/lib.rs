@@ -63,12 +63,14 @@
 //! # Ok(()) }
 //! ```
 
+pub mod catalog;
 pub mod error;
 pub mod grant;
 pub mod policy;
 pub mod principal;
 pub mod revocation;
 
+pub use catalog::{AuditEntry, Catalog, CatalogLog, CatalogOp, EffectiveGrant};
 pub use error::IamError;
 pub use grant::{Grant, Iam, LinkInfo, Scope, render_resource, simple_policy};
 pub use policy::{Conditions, Effect, Policy, ResourceMatch, Role, Statement};

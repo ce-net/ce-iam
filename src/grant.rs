@@ -240,6 +240,26 @@ impl Iam {
         Ok(Grant::from_chain(vec![cap]))
     }
 
+    /// Mint a root grant **from a named role in a [`Catalog`]**, attaching the role to the audience
+    /// in passing. This is the managed-product convenience: instead of handing [`Iam::mint`] a raw
+    /// policy, name a role the catalog already stores. The resulting capability is, as always, an
+    /// immutable signed token — a *later* edit to the catalog role can never broaden it.
+    ///
+    /// Returns [`IamError::BadPolicy`] if `role` is not in the catalog.
+    pub fn mint_role(
+        &self,
+        issuer: &Identity,
+        audience: Principal,
+        catalog: &crate::catalog::Catalog,
+        role: &str,
+        nonce: u64,
+    ) -> Result<Grant, IamError> {
+        let r = catalog
+            .get_role(role)
+            .ok_or_else(|| IamError::BadPolicy(format!("no such role '{role}' in catalog")))?;
+        self.mint(issuer, audience, &r.policy, nonce)
+    }
+
     /// **Attenuate** (sub-delegate) an existing grant: the current holder `holder` issues a
     /// *narrower* grant to a new `audience`. This is `sts:AssumeRole` with a more-restrictive
     /// session policy.
