@@ -251,7 +251,11 @@ pub struct Role {
 impl Role {
     /// Construct a role.
     pub fn new(name: impl Into<String>, policy: Policy) -> Role {
-        Role { name: name.into(), description: None, policy }
+        Role {
+            name: name.into(),
+            description: None,
+            policy,
+        }
     }
 
     /// Parse a role from JSON.
@@ -347,7 +351,10 @@ mod tests {
         let p = Policy::allow(
             vec!["storage:read".into()],
             ResourceMatch::Tag("gpu".into()),
-            Conditions { not_after: Some(42), ..Default::default() },
+            Conditions {
+                not_after: Some(42),
+                ..Default::default()
+            },
         );
         let json = p.to_json();
         let back = Policy::from_json(&json).unwrap();
@@ -377,7 +384,11 @@ mod tests {
     fn role_round_trips() {
         let role = Role::new(
             "storage-reader",
-            Policy::allow(vec!["storage:read".into()], ResourceMatch::Any, Conditions::default()),
+            Policy::allow(
+                vec!["storage:read".into()],
+                ResourceMatch::Any,
+                Conditions::default(),
+            ),
         );
         let json = role.to_json();
         let back = Role::from_json(&json).unwrap();

@@ -42,6 +42,12 @@ use crate::error::IamError;
 use crate::policy::{Conditions, Policy, ResourceMatch, Role};
 use crate::principal::Principal;
 
+/// Maximum number of audit entries retained in-memory. The audit trail grows one line per mutation;
+/// past this many lines the oldest are dropped (the version counter and live state are unaffected),
+/// removing the unbounded-memory path for a long-lived catalog. Durable, complete history lives in
+/// the on-disk op-log ([`crate::store::CatalogStore`]); this in-memory ring is a recent-activity view.
+pub const MAX_AUDIT_ENTRIES: usize = 10_000;
+
 /// A monotonic op index, matching `ce_coord::Version`. The catalog writer assigns it; readers
 /// converge to it. We keep our own alias so the catalog is usable (and testable) without pulling the
 /// whole ce-coord runtime into the compile graph — the live wiring maps it onto `ce_coord::Version`.
@@ -202,6 +208,12 @@ impl Catalog {
             target,
             actor: actor.map(|p| p.hex()),
         });
+        // Bound the in-memory audit ring: drop the oldest entries past the cap. Complete history is
+        // recoverable from the durable op-log; this keeps memory bounded for a long-lived catalog.
+        if self.audit.len() > MAX_AUDIT_ENTRIES {
+            let overflow = self.audit.len() - MAX_AUDIT_ENTRIES;
+            self.audit.drain(0..overflow);
+        }
     }
 
     // ---- role CRUD ----
@@ -276,9 +288,17 @@ impl Catalog {
         actor: Option<&Principal>,
     ) -> Result<Version, IamError> {
         if !self.roles.contains_key(role) {
-            return Err(IamError::BadPolicy(format!("no such role '{role}' to attach")));
+            return Err(IamError::BadPolicy(format!(
+                "no such role '{role}' to attach"
+            )));
         }
-        self.apply(CatalogOp::AttachRole { principal, role: role.to_string() }, actor);
+        self.apply(
+            CatalogOp::AttachRole {
+                principal,
+                role: role.to_string(),
+            },
+            actor,
+        );
         Ok(self.version)
     }
 
@@ -289,13 +309,46 @@ impl Catalog {
         role: &str,
         actor: Option<&Principal>,
     ) -> Version {
-        self.apply(CatalogOp::DetachRole { principal, role: role.to_string() }, actor);
+        self.apply(
+            CatalogOp::DetachRole {
+                principal,
+                role: role.to_string(),
+            },
+            actor,
+        );
         self.version
     }
 
     /// The role names attached to a principal, sorted.
     pub fn roles_for(&self, principal: &Principal) -> Vec<String> {
-        self.attachments.get(&principal.hex()).cloned().unwrap_or_default()
+        self.attachments
+            .get(&principal.hex())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every `(principal, role)` attachment, in deterministic order (principal hex, then role name).
+    /// Used to snapshot the attachment state, e.g. when compacting the durable op-log.
+    pub fn all_attachments(&self) -> Vec<(Principal, String)> {
+        let mut out = Vec::new();
+        for (hex, roles) in &self.attachments {
+            // The key is always a valid principal hex (it was produced by Principal::hex), but parse
+            // defensively rather than unwrap, skipping any unparseable key.
+            if let Ok(p) = Principal::parse(hex) {
+                for r in roles {
+                    out.push((p, r.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The principals that have any role attached, sorted by hex.
+    pub fn principals_with_roles(&self) -> Vec<Principal> {
+        self.attachments
+            .keys()
+            .filter_map(|h| Principal::parse(h).ok())
+            .collect()
     }
 
     // ---- effective-grant resolution ----
@@ -310,10 +363,7 @@ impl Catalog {
     /// Roles are resolved in sorted name order and the result is deterministic, so two replicas at
     /// the same version compute identical effective grants. This is a *report*, not an issuance: it
     /// describes what minting would produce; it does not touch any already-issued token.
-    pub fn effective_grants(
-        &self,
-        principal: &Principal,
-    ) -> Result<Vec<EffectiveGrant>, IamError> {
+    pub fn effective_grants(&self, principal: &Principal) -> Result<Vec<EffectiveGrant>, IamError> {
         // Group abilities by (resource, conditions). We key on the JSON of the scope so distinct
         // resources/conditions never collide and the grouping is deterministic.
         let mut groups: BTreeMap<String, (ResourceMatch, Conditions, Vec<String>, Vec<String>)> =
@@ -343,7 +393,12 @@ impl Catalog {
                 }
                 let key = scope_key(&stmt.resource, &stmt.conditions)?;
                 let group = groups.entry(key).or_insert_with(|| {
-                    (stmt.resource.clone(), stmt.conditions.clone(), Vec::new(), Vec::new())
+                    (
+                        stmt.resource.clone(),
+                        stmt.conditions.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
                 });
                 group.2.extend(stmt.actions.iter().cloned());
                 if !group.3.contains(&role_name) {
@@ -352,22 +407,23 @@ impl Catalog {
             }
         }
 
-        let mut out: Vec<EffectiveGrant> = groups
+        // `groups` is a `BTreeMap` keyed by the scope JSON, so `into_iter` already yields entries in
+        // deterministic key order — no fallible re-keying in a sort comparator is needed.
+        let out: Vec<EffectiveGrant> = groups
             .into_values()
             .map(|(resource, conditions, mut abilities, mut from_roles)| {
                 abilities.sort();
                 abilities.dedup();
                 from_roles.sort();
                 from_roles.dedup();
-                EffectiveGrant { abilities, resource, conditions, from_roles }
+                EffectiveGrant {
+                    abilities,
+                    resource,
+                    conditions,
+                    from_roles,
+                }
             })
             .collect();
-        // Deterministic order independent of map iteration: sort by the rendered scope.
-        out.sort_by(|a, b| {
-            scope_key(&a.resource, &a.conditions)
-                .unwrap_or_default()
-                .cmp(&scope_key(&b.resource, &b.conditions).unwrap_or_default())
-        });
         Ok(out)
     }
 
@@ -380,7 +436,11 @@ impl Catalog {
 
     /// Audit entries at version `> after` (for incremental polling). `after = 0` returns everything.
     pub fn audit_since(&self, after: Version) -> Vec<AuditEntry> {
-        self.audit.iter().filter(|e| e.version > after).cloned().collect()
+        self.audit
+            .iter()
+            .filter(|e| e.version > after)
+            .cloned()
+            .collect()
     }
 }
 
@@ -480,7 +540,11 @@ mod tests {
     #[test]
     fn policy_crud_round_trip() {
         let mut cat = Catalog::new();
-        let p = Policy::allow(vec!["db:read".into()], ResourceMatch::Any, Conditions::default());
+        let p = Policy::allow(
+            vec!["db:read".into()],
+            ResourceMatch::Any,
+            Conditions::default(),
+        );
         cat.put_policy("ro", p.clone(), None).unwrap();
         assert_eq!(cat.get_policy("ro"), Some(&p));
         assert_eq!(cat.list_policies(), vec!["ro".to_string()]);
@@ -494,7 +558,11 @@ mod tests {
         cat.put_role(reader_role("r"), None).unwrap();
         let updated = Role::new(
             "r",
-            Policy::allow(vec!["storage:write".into()], ResourceMatch::Any, Conditions::default()),
+            Policy::allow(
+                vec!["storage:write".into()],
+                ResourceMatch::Any,
+                Conditions::default(),
+            ),
         );
         cat.put_role(updated.clone(), None).unwrap();
         assert_eq!(cat.get_role("r"), Some(&updated));
@@ -507,16 +575,29 @@ mod tests {
     #[test]
     fn put_role_rejects_empty_name() {
         let mut cat = Catalog::new();
-        let bad = Role::new("  ", Policy::allow(vec!["x".into()], ResourceMatch::Any, Conditions::default()));
-        assert!(matches!(cat.put_role(bad, None).unwrap_err(), IamError::BadPolicy(_)));
-        assert_eq!(cat.version(), 0, "a rejected op must not advance the version");
+        let bad = Role::new(
+            "  ",
+            Policy::allow(vec!["x".into()], ResourceMatch::Any, Conditions::default()),
+        );
+        assert!(matches!(
+            cat.put_role(bad, None).unwrap_err(),
+            IamError::BadPolicy(_)
+        ));
+        assert_eq!(
+            cat.version(),
+            0,
+            "a rejected op must not advance the version"
+        );
     }
 
     #[test]
     fn put_policy_rejects_empty_name() {
         let mut cat = Catalog::new();
         let p = Policy::allow(vec!["x".into()], ResourceMatch::Any, Conditions::default());
-        assert!(matches!(cat.put_policy("", p, None).unwrap_err(), IamError::BadPolicy(_)));
+        assert!(matches!(
+            cat.put_policy("", p, None).unwrap_err(),
+            IamError::BadPolicy(_)
+        ));
     }
 
     #[test]
@@ -555,12 +636,26 @@ mod tests {
     fn effective_grants_union_abilities_same_scope() {
         let mut cat = Catalog::new();
         cat.put_role(
-            Role::new("a", Policy::allow(vec!["storage:read".into()], ResourceMatch::Any, Conditions::default())),
+            Role::new(
+                "a",
+                Policy::allow(
+                    vec!["storage:read".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
+            ),
             None,
         )
         .unwrap();
         cat.put_role(
-            Role::new("b", Policy::allow(vec!["storage:write".into()], ResourceMatch::Any, Conditions::default())),
+            Role::new(
+                "b",
+                Policy::allow(
+                    vec!["storage:write".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
+            ),
             None,
         )
         .unwrap();
@@ -568,8 +663,15 @@ mod tests {
         cat.attach_role(principal(1), "b", None).unwrap();
 
         let eff = cat.effective_grants(&principal(1)).unwrap();
-        assert_eq!(eff.len(), 1, "same resource+conditions collapse to one grant");
-        assert_eq!(eff[0].abilities, vec!["storage:read".to_string(), "storage:write".to_string()]);
+        assert_eq!(
+            eff.len(),
+            1,
+            "same resource+conditions collapse to one grant"
+        );
+        assert_eq!(
+            eff[0].abilities,
+            vec!["storage:read".to_string(), "storage:write".to_string()]
+        );
         assert_eq!(eff[0].resource, ResourceMatch::Any);
         assert_eq!(eff[0].from_roles, vec!["a".to_string(), "b".to_string()]);
     }
@@ -578,14 +680,25 @@ mod tests {
     fn effective_grants_split_by_distinct_scope() {
         let mut cat = Catalog::new();
         cat.put_role(
-            Role::new("any", Policy::allow(vec!["storage:read".into()], ResourceMatch::Any, Conditions::default())),
+            Role::new(
+                "any",
+                Policy::allow(
+                    vec!["storage:read".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
+            ),
             None,
         )
         .unwrap();
         cat.put_role(
             Role::new(
                 "gpu",
-                Policy::allow(vec!["run:deploy".into()], ResourceMatch::Tag("gpu".into()), Conditions::default()),
+                Policy::allow(
+                    vec!["run:deploy".into()],
+                    ResourceMatch::Tag("gpu".into()),
+                    Conditions::default(),
+                ),
             ),
             None,
         )
@@ -646,7 +759,10 @@ mod tests {
         };
         cat.put_role(Role::new("empty", bad), None).unwrap();
         cat.attach_role(principal(4), "empty", None).unwrap();
-        assert!(matches!(cat.effective_grants(&principal(4)).unwrap_err(), IamError::BadPolicy(_)));
+        assert!(matches!(
+            cat.effective_grants(&principal(4)).unwrap_err(),
+            IamError::BadPolicy(_)
+        ));
     }
 
     #[test]
@@ -675,15 +791,32 @@ mod tests {
             CatalogOp::PutRole(reader_role("reader")),
             CatalogOp::PutPolicy {
                 name: "p1".into(),
-                policy: Policy::allow(vec!["db:read".into()], ResourceMatch::Any, Conditions::default()),
+                policy: Policy::allow(
+                    vec!["db:read".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
             },
-            CatalogOp::AttachRole { principal: principal(1), role: "reader".into() },
+            CatalogOp::AttachRole {
+                principal: principal(1),
+                role: "reader".into(),
+            },
             CatalogOp::PutRole(Role::new(
                 "writer",
-                Policy::allow(vec!["storage:write".into()], ResourceMatch::Any, Conditions::default()),
+                Policy::allow(
+                    vec!["storage:write".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
             )),
-            CatalogOp::AttachRole { principal: principal(1), role: "writer".into() },
-            CatalogOp::DetachRole { principal: principal(1), role: "reader".into() },
+            CatalogOp::AttachRole {
+                principal: principal(1),
+                role: "writer".into(),
+            },
+            CatalogOp::DetachRole {
+                principal: principal(1),
+                role: "reader".into(),
+            },
         ];
         for op in ops {
             writer.apply(op.clone(), Some(&actor));
@@ -691,7 +824,10 @@ mod tests {
         }
 
         let reader = log.replay();
-        assert_eq!(reader, writer, "a full replay must reproduce the writer exactly");
+        assert_eq!(
+            reader, writer,
+            "a full replay must reproduce the writer exactly"
+        );
         assert_eq!(reader.version(), writer.version());
         assert_eq!(reader.version(), log.len() as Version);
     }
@@ -700,7 +836,13 @@ mod tests {
     fn partial_replay_is_a_prefix_of_full() {
         let mut log = CatalogLog::new();
         log.record(CatalogOp::PutRole(reader_role("r")), None);
-        log.record(CatalogOp::AttachRole { principal: principal(1), role: "r".into() }, None);
+        log.record(
+            CatalogOp::AttachRole {
+                principal: principal(1),
+                role: "r".into(),
+            },
+            None,
+        );
         log.record(CatalogOp::RemoveRole("r".into()), None);
 
         let at1 = log.replay_through(1);
@@ -720,16 +862,30 @@ mod tests {
         // the order, but the resulting state is the same set of independent insertions).
         let mut a = Catalog::new();
         a.apply(CatalogOp::PutRole(reader_role("x")), None);
-        a.apply(CatalogOp::PutPolicy {
-            name: "y".into(),
-            policy: Policy::allow(vec!["db:read".into()], ResourceMatch::Any, Conditions::default()),
-        }, None);
+        a.apply(
+            CatalogOp::PutPolicy {
+                name: "y".into(),
+                policy: Policy::allow(
+                    vec!["db:read".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
+            },
+            None,
+        );
 
         let mut b = Catalog::new();
-        b.apply(CatalogOp::PutPolicy {
-            name: "y".into(),
-            policy: Policy::allow(vec!["db:read".into()], ResourceMatch::Any, Conditions::default()),
-        }, None);
+        b.apply(
+            CatalogOp::PutPolicy {
+                name: "y".into(),
+                policy: Policy::allow(
+                    vec!["db:read".into()],
+                    ResourceMatch::Any,
+                    Conditions::default(),
+                ),
+            },
+            None,
+        );
         b.apply(CatalogOp::PutRole(reader_role("x")), None);
 
         // Same roles and policies regardless of order; only the audit/version order differs.

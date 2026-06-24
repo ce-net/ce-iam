@@ -15,8 +15,10 @@
 //! offline default (revokes nothing — combine with short capability expiries for liveness).
 
 use crate::error::IamError;
+use crate::store::{atomic_write_json, load_json_or_default};
 use ce_identity::NodeId;
 use std::collections::HashSet;
+use std::path::Path;
 
 /// An immutable snapshot of the on-chain revoked `(issuer, nonce)` set.
 #[derive(Debug, Clone, Default)]
@@ -27,12 +29,16 @@ pub struct RevocationSet {
 impl RevocationSet {
     /// An empty set (revokes nothing) — the safe offline default.
     pub fn empty() -> RevocationSet {
-        RevocationSet { revoked: HashSet::new() }
+        RevocationSet {
+            revoked: HashSet::new(),
+        }
     }
 
     /// Build directly from `(issuer_node_id, nonce)` pairs (testing / custom sources).
     pub fn from_pairs(pairs: impl IntoIterator<Item = (NodeId, u64)>) -> RevocationSet {
-        RevocationSet { revoked: pairs.into_iter().collect() }
+        RevocationSet {
+            revoked: pairs.into_iter().collect(),
+        }
     }
 
     /// Build from the wire form returned by [`ce_rs::CeClient::revoked`]: `(issuer_hex, nonce)`.
@@ -42,10 +48,10 @@ impl RevocationSet {
     pub fn from_hex_pairs(pairs: &[(String, u64)]) -> RevocationSet {
         let mut revoked = HashSet::new();
         for (issuer_hex, nonce) in pairs {
-            if let Ok(bytes) = hex::decode(issuer_hex.trim()) {
-                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                    revoked.insert((arr, *nonce));
-                }
+            if let Ok(bytes) = hex::decode(issuer_hex.trim())
+                && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+            {
+                revoked.insert((arr, *nonce));
             }
         }
         RevocationSet { revoked }
@@ -82,6 +88,89 @@ impl RevocationSet {
     }
 }
 
+/// How a verifier should behave when the live revocation set cannot be fetched.
+///
+/// Revocation is freshness-sensitive: between fetches, a verifier works from a snapshot. When the
+/// node is unreachable, the operator must choose a stance. [`RevocationPolicy::FailOpen`] keeps
+/// verifying against the last-known-good (or empty) snapshot — favoring availability, relying on
+/// short capability expiries for safety. [`RevocationPolicy::FailClosed`] denies everything when the
+/// snapshot is stale and unrefreshable — favoring safety over availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationPolicy {
+    /// On fetch failure, keep using the last-known-good snapshot (deny nothing extra).
+    FailOpen,
+    /// On fetch failure past the TTL, deny all verification until a fresh snapshot is obtained.
+    FailClosed,
+}
+
+/// A last-known-good revocation snapshot with a freshness timestamp, persisted so a verifier can keep
+/// enforcing across a transient node outage instead of choosing between "block everything" and "drop
+/// revocation entirely".
+///
+/// `fetched_at` is the unix time the snapshot was obtained; `ttl_secs` is how long it is considered
+/// fresh. [`CachedRevocationSet::refresh`] tries to fetch a new snapshot, updating the cache on
+/// success and leaving the previous one in place on failure. [`CachedRevocationSet::is_fresh`] tells a
+/// verifier whether the snapshot is still within its TTL at `now`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CachedRevocationSet {
+    /// The revoked `(issuer_hex, nonce)` pairs of the last good fetch.
+    pairs: Vec<(String, u64)>,
+    /// Unix seconds the snapshot was fetched. `0` = never fetched.
+    pub fetched_at: u64,
+    /// Freshness window in seconds. `0` = treat any snapshot as fresh forever (no TTL).
+    pub ttl_secs: u64,
+}
+
+impl CachedRevocationSet {
+    /// Load a cached snapshot from `path`, or a never-fetched default if absent. `ttl_secs` sets the
+    /// freshness window applied going forward.
+    pub fn load(path: &Path, ttl_secs: u64) -> Result<CachedRevocationSet, IamError> {
+        let mut c: CachedRevocationSet = load_json_or_default(path)?;
+        c.ttl_secs = ttl_secs;
+        Ok(c)
+    }
+
+    /// The materialized [`RevocationSet`] from the cached pairs.
+    pub fn set(&self) -> RevocationSet {
+        RevocationSet::from_hex_pairs(&self.pairs)
+    }
+
+    /// Is the snapshot still fresh at `now` (fetched, and within the TTL)? A `ttl_secs` of `0` means
+    /// "no TTL": any obtained snapshot is fresh. A never-fetched snapshot is never fresh.
+    pub fn is_fresh(&self, now: u64) -> bool {
+        if self.fetched_at == 0 {
+            return false;
+        }
+        if self.ttl_secs == 0 {
+            return true;
+        }
+        now.saturating_sub(self.fetched_at) <= self.ttl_secs
+    }
+
+    /// Try to refresh the snapshot from the node. On success, replace the cached pairs and stamp
+    /// `fetched_at = now`, optionally persisting to `path`. On failure, the previous snapshot is kept
+    /// and the error is returned (the caller decides fail-open vs fail-closed using [`is_fresh`]).
+    ///
+    /// [`is_fresh`]: CachedRevocationSet::is_fresh
+    pub async fn refresh(
+        &mut self,
+        client: &ce_rs::CeClient,
+        now: u64,
+        path: Option<&Path>,
+    ) -> Result<(), IamError> {
+        let pairs = client
+            .revoked()
+            .await
+            .map_err(|e| IamError::Node(format!("fetching revoked set: {e}")))?;
+        self.pairs = pairs;
+        self.fetched_at = now;
+        if let Some(p) = path {
+            atomic_write_json(p, self)?;
+        }
+        Ok(())
+    }
+}
+
 /// Submit an on-chain `RevokeCapability` for a `(this-node, nonce)` grant the local node issued.
 ///
 /// This is the one CE endpoint [`ce_rs`] does not wrap (`POST /capabilities/revoke`), so we issue
@@ -94,7 +183,9 @@ pub async fn submit_revoke(
     nonce: u64,
 ) -> Result<String, IamError> {
     let url = format!("{}/capabilities/revoke", base_url.trim_end_matches('/'));
-    let mut req = reqwest::Client::new().post(&url).json(&serde_json::json!({ "nonce": nonce }));
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "nonce": nonce }));
     if let Some(t) = api_token.map(str::trim).filter(|t| !t.is_empty()) {
         req = req.bearer_auth(t);
     }
@@ -104,7 +195,12 @@ pub async fn submit_revoke(
         .map_err(|e| IamError::Node(format!("POST {url}: {e}")))?;
     if !resp.status().is_success() {
         let code = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        // Surface the body when readable; note (rather than silently swallow) a body-read failure so
+        // an operator can see why the read failed instead of seeing an empty reason.
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => format!("<failed to read response body: {e}>"),
+        };
         return Err(IamError::Node(format!("revoke rejected ({code}): {body}")));
     }
     #[derive(serde::Deserialize)]
@@ -169,5 +265,45 @@ mod tests {
         let pred = set.predicate();
         assert!(pred(&issuer, 1));
         assert!(!pred(&issuer, 2));
+    }
+
+    #[test]
+    fn cached_freshness_semantics() {
+        // Never fetched => never fresh.
+        let mut c = CachedRevocationSet {
+            ttl_secs: 100,
+            ..Default::default()
+        };
+        assert!(!c.is_fresh(1000));
+        // Fetched at 1000, TTL 100 => fresh through 1100.
+        c.fetched_at = 1000;
+        assert!(c.is_fresh(1000));
+        assert!(c.is_fresh(1100));
+        assert!(!c.is_fresh(1101));
+        // TTL 0 => fresh forever once fetched.
+        c.ttl_secs = 0;
+        assert!(c.is_fresh(u64::MAX));
+    }
+
+    #[test]
+    fn cached_set_materializes_pairs() {
+        let good = [0x22u8; 32];
+        let c = CachedRevocationSet {
+            pairs: vec![(hex::encode(good), 7)],
+            fetched_at: 1,
+            ttl_secs: 0,
+        };
+        let set = c.set();
+        assert!(set.is_revoked(&good, 7));
+    }
+
+    #[test]
+    fn cached_load_missing_is_default() {
+        let dir = std::env::temp_dir().join(format!("ce-iam-rev-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = CachedRevocationSet::load(&dir.join("nope.json"), 60).unwrap();
+        assert_eq!(c.fetched_at, 0);
+        assert_eq!(c.ttl_secs, 60);
+        assert!(!c.is_fresh(1000));
     }
 }

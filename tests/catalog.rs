@@ -38,7 +38,11 @@ fn iam() -> Iam {
 fn reader_role(name: &str) -> Role {
     Role::new(
         name,
-        simple_policy(vec!["storage:read".into()], ResourceMatch::Any, Conditions::default()),
+        simple_policy(
+            vec!["storage:read".into()],
+            ResourceMatch::Any,
+            Conditions::default(),
+        ),
     )
 }
 
@@ -58,14 +62,28 @@ fn catalog_crud_converges_over_coord_log() {
         CatalogOp::PutRole(reader_role("reader")),
         CatalogOp::PutRole(Role::new(
             "writer",
-            simple_policy(vec!["storage:write".into()], ResourceMatch::Any, Conditions::default()),
+            simple_policy(
+                vec!["storage:write".into()],
+                ResourceMatch::Any,
+                Conditions::default(),
+            ),
         )),
         CatalogOp::PutPolicy {
             name: "audit-only".into(),
-            policy: simple_policy(vec!["db:read".into()], ResourceMatch::Any, Conditions::default()),
+            policy: simple_policy(
+                vec!["db:read".into()],
+                ResourceMatch::Any,
+                Conditions::default(),
+            ),
         },
-        CatalogOp::AttachRole { principal: alice, role: "reader".into() },
-        CatalogOp::AttachRole { principal: alice, role: "writer".into() },
+        CatalogOp::AttachRole {
+            principal: alice,
+            role: "reader".into(),
+        },
+        CatalogOp::AttachRole {
+            principal: alice,
+            role: "writer".into(),
+        },
         CatalogOp::RemoveRole("writer".into()),
     ];
     for op in &script {
@@ -93,13 +111,22 @@ fn two_independent_replicas_of_same_log_are_identical() {
     let mut log = CatalogLog::new();
     log.record(CatalogOp::PutRole(reader_role("a")), None);
     log.record(CatalogOp::PutRole(reader_role("b")), None);
-    log.record(CatalogOp::AttachRole { principal: Principal([1u8; 32]), role: "a".into() }, None);
+    log.record(
+        CatalogOp::AttachRole {
+            principal: Principal([1u8; 32]),
+            role: "a".into(),
+        },
+        None,
+    );
 
     let r1 = log.replay();
     let r2 = log.replay();
     assert_eq!(r1, r2, "two readers of the same log converge");
     // Serialized form is identical too (deterministic BTreeMap ordering).
-    assert_eq!(serde_json::to_string(&r1).unwrap(), serde_json::to_string(&r2).unwrap());
+    assert_eq!(
+        serde_json::to_string(&r1).unwrap(),
+        serde_json::to_string(&r2).unwrap()
+    );
 }
 
 // ============================ effective-grant resolution ====================================
@@ -115,7 +142,11 @@ fn effective_grants_match_minted_capability() {
     cat.put_role(
         Role::new(
             "lister",
-            simple_policy(vec!["storage:list".into()], ResourceMatch::Any, Conditions::default()),
+            simple_policy(
+                vec!["storage:list".into()],
+                ResourceMatch::Any,
+                Conditions::default(),
+            ),
         ),
         None,
     )
@@ -126,21 +157,55 @@ fn effective_grants_match_minted_capability() {
     // The catalog reports one effective grant: {storage:list, storage:read} on Any.
     let eff = cat.effective_grants(&alice).unwrap();
     assert_eq!(eff.len(), 1);
-    assert_eq!(eff[0].abilities, vec!["storage:list".to_string(), "storage:read".to_string()]);
+    assert_eq!(
+        eff[0].abilities,
+        vec!["storage:list".to_string(), "storage:read".to_string()]
+    );
 
     // Minting that exact effective grant produces a capability that authorizes precisely those
     // actions and nothing else — the report is faithful to issuance.
-    let policy = simple_policy(eff[0].abilities.clone(), eff[0].resource.clone(), eff[0].conditions.clone());
+    let policy = simple_policy(
+        eff[0].abilities.clone(),
+        eff[0].resource.clone(),
+        eff[0].conditions.clone(),
+    );
     let grant = iam.mint(&issuer, alice, &policy, 1).unwrap();
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:read", &grant.token, &never_revoked)
-        .is_ok());
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:list", &grant.token, &never_revoked)
-        .is_ok());
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:write", &grant.token, &never_revoked)
-        .is_err());
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:read",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:list",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:write",
+            &grant.token,
+            &never_revoked
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -152,9 +217,18 @@ fn mint_role_uses_catalog_role() {
     cat.put_role(reader_role("reader"), None).unwrap();
 
     let grant = iam.mint_role(&issuer, alice, &cat, "reader", 5).unwrap();
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:read", &grant.token, &never_revoked)
-        .is_ok());
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:read",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
 
     // Minting from a missing role is a clean error, not a panic.
     assert!(matches!(
@@ -176,12 +250,30 @@ fn widening_a_role_does_not_broaden_an_issued_token() {
 
     // Issue a token from the narrow role.
     let grant = iam.mint_role(&issuer, alice, &cat, "role", 1).unwrap();
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:read", &grant.token, &never_revoked)
-        .is_ok());
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:write", &grant.token, &never_revoked)
-        .is_err());
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:read",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:write",
+            &grant.token,
+            &never_revoked
+        )
+        .is_err()
+    );
 
     // Now WIDEN the catalog role to also grant storage:write.
     cat.put_role(
@@ -199,20 +291,46 @@ fn widening_a_role_does_not_broaden_an_issued_token() {
 
     // The ALREADY-ISSUED token is unchanged: it still authorizes only storage:read. A catalog edit
     // cannot retroactively broaden a signed capability in a holder's wallet.
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:read", &grant.token, &never_revoked)
-        .is_ok());
     assert!(
-        iam.verify(&issuer.node_id(), &[], 0, &alice, "storage:write", &grant.token, &never_revoked)
-            .is_err(),
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:read",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:write",
+            &grant.token,
+            &never_revoked
+        )
+        .is_err(),
         "widening the catalog role must NOT broaden the issued token"
     );
 
     // Only a FRESH mint from the widened role carries the new authority (and it is a distinct token).
     let grant2 = iam.mint_role(&issuer, alice, &cat, "role", 2).unwrap();
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:write", &grant2.token, &never_revoked)
-        .is_ok());
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:write",
+            &grant2.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
     assert_ne!(grant.token, grant2.token);
 }
 
@@ -232,9 +350,18 @@ fn deleting_a_role_does_not_revoke_an_issued_token() {
     assert!(cat.effective_grants(&alice).unwrap().is_empty());
 
     // The issued token still verifies — deletion changed only future issuance, not live tokens.
-    assert!(iam
-        .verify(&issuer.node_id(), &[], 0, &alice, "storage:read", &grant.token, &never_revoked)
-        .is_ok());
+    assert!(
+        iam.verify(
+            &issuer.node_id(),
+            &[],
+            0,
+            &alice,
+            "storage:read",
+            &grant.token,
+            &never_revoked
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -252,7 +379,10 @@ fn issued_token_scope_is_byte_stable_across_catalog_edits() {
 
     // Churn: widen, attach, detach, delete, re-create with a totally different policy.
     cat.put_role(
-        Role::new("role", simple_policy(vec!["*".into()], ResourceMatch::Any, Conditions::default())),
+        Role::new(
+            "role",
+            simple_policy(vec!["*".into()], ResourceMatch::Any, Conditions::default()),
+        ),
         None,
     )
     .unwrap();
@@ -260,13 +390,23 @@ fn issued_token_scope_is_byte_stable_across_catalog_edits() {
     cat.detach_role(alice, "role", None);
     cat.remove_role("role", None);
     cat.put_role(
-        Role::new("role", simple_policy(vec!["db:admin".into()], ResourceMatch::Tag("x".into()), Conditions::default())),
+        Role::new(
+            "role",
+            simple_policy(
+                vec!["db:admin".into()],
+                ResourceMatch::Tag("x".into()),
+                Conditions::default(),
+            ),
+        ),
         None,
     )
     .unwrap();
 
     let scope_after = iam.inspect(&grant.token).unwrap();
-    assert_eq!(scope_before, scope_after, "the issued token's scope must be immutable");
+    assert_eq!(
+        scope_before, scope_after,
+        "the issued token's scope must be immutable"
+    );
 }
 
 // ============================ property tests ================================================

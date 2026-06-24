@@ -206,4 +206,104 @@ proptest! {
         let back = Principal::parse(&p.hex()).unwrap();
         prop_assert_eq!(p, back);
     }
+
+    /// Multi-link (depth >= 3) attenuation: a 3-deep chain authorizes exactly the leaf's actions,
+    /// always a subset of every ancestor's, and never more than the root granted.
+    #[test]
+    fn deep_chain_never_amplifies(
+        root_actions in action_subset(),
+        mid_actions in action_subset(),
+        leaf_actions in action_subset(),
+    ) {
+        let iam = iam();
+        let org = fresh_identity();
+        let alice = fresh_identity();
+        let bob = fresh_identity();
+        let carol = fresh_identity();
+
+        let g1 = iam.mint(
+            &org, Principal(alice.node_id()),
+            &simple_policy(root_actions.clone(), ResourceMatch::Any, Conditions::default()), 1,
+        ).unwrap();
+
+        // alice -> bob: only succeeds if mid ⊆ root.
+        let mid_is_subset = mid_actions.iter().all(|a| root_actions.contains(a));
+        let g2 = iam.attenuate(
+            &alice, &g1, Principal(bob.node_id()),
+            &simple_policy(mid_actions.clone(), ResourceMatch::Any, Conditions::default()), 2,
+        );
+        if !mid_is_subset {
+            prop_assert!(g2.is_err());
+            return Ok(());
+        }
+        let g2 = g2.unwrap();
+
+        // bob -> carol: only succeeds if leaf ⊆ mid.
+        let leaf_is_subset = leaf_actions.iter().all(|a| mid_actions.contains(a));
+        let g3 = iam.attenuate(
+            &bob, &g2, Principal(carol.node_id()),
+            &simple_policy(leaf_actions.clone(), ResourceMatch::Any, Conditions::default()), 3,
+        );
+        if !leaf_is_subset {
+            prop_assert!(g3.is_err());
+            return Ok(());
+        }
+        let g3 = g3.unwrap();
+        prop_assert_eq!(g3.chain.len(), 3);
+
+        // carol's authority is exactly leaf_actions, and ⊆ root_actions.
+        for action in UNIVERSE {
+            let allowed = iam
+                .verify(&org.node_id(), &[], 0, &Principal(carol.node_id()), action, &g3.token, &never_revoked)
+                .is_ok();
+            prop_assert_eq!(allowed, leaf_actions.iter().any(|a| a == action));
+            if allowed {
+                prop_assert!(root_actions.iter().any(|a| a == action),
+                    "depth-3 leaf allowed {} the root never granted", action);
+            }
+        }
+    }
+
+    /// DoS bound: a chain deeper than the configured max-depth is rejected as malformed, never
+    /// authorized, regardless of how the deep chain was built. We build a long legitimate chain and
+    /// verify it under a tight depth limit.
+    #[test]
+    fn depth_limit_rejects_long_chains(extra in 2usize..8) {
+        let limit = 1;
+        let iam = iam().with_max_chain_depth(limit);
+        let org = fresh_identity();
+        let mut holder = fresh_identity();
+        let mut grant = iam.mint(
+            &org, Principal(holder.node_id()),
+            &simple_policy(vec!["a:read".into()], ResourceMatch::Any, Conditions::default()), 1,
+        ).unwrap();
+        // Build a chain of depth `extra + 1` > limit.
+        for n in 0..extra {
+            let next = fresh_identity();
+            grant = iam.attenuate(
+                &holder, &grant, Principal(next.node_id()),
+                &simple_policy(vec!["a:read".into()], ResourceMatch::Any, Conditions::default()),
+                (n as u64) + 2,
+            ).unwrap();
+            holder = next;
+        }
+        let r = iam.verify(&org.node_id(), &[], 0, &Principal(holder.node_id()), "a:read", &grant.token, &never_revoked);
+        prop_assert!(matches!(r, Err(ce_iam::IamError::MalformedChain(_))));
+    }
+
+    /// DoS bound: an oversized token (longer than max_token_bytes) is rejected before decoding.
+    #[test]
+    fn oversize_token_rejected(pad in 1usize..4096) {
+        let iam = iam().with_max_token_bytes(32);
+        let org = fresh_identity();
+        let alice = fresh_identity();
+        let grant = iam.mint(
+            &org, Principal(alice.node_id()),
+            &simple_policy(vec!["a:read".into()], ResourceMatch::Any, Conditions::default()), 1,
+        ).unwrap();
+        // The real token already exceeds 32 bytes; appending more keeps it oversized.
+        let big = format!("{}{}", grant.token, "0".repeat(pad));
+        let r = iam.verify(&org.node_id(), &[], 0, &Principal(alice.node_id()), "a:read", &big, &never_revoked);
+        prop_assert!(matches!(r, Err(ce_iam::IamError::MalformedChain(m)) if m.contains("limit")));
+    }
 }

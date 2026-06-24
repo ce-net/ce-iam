@@ -69,13 +69,19 @@ pub mod grant;
 pub mod policy;
 pub mod principal;
 pub mod revocation;
+pub mod roots;
+pub mod store;
+pub mod wallet;
 
 pub use catalog::{AuditEntry, Catalog, CatalogLog, CatalogOp, EffectiveGrant};
 pub use error::IamError;
 pub use grant::{Grant, Iam, LinkInfo, Scope, render_resource, simple_policy};
 pub use policy::{Conditions, Effect, Policy, ResourceMatch, Role, Statement};
 pub use principal::Principal;
-pub use revocation::RevocationSet;
+pub use revocation::{CachedRevocationSet, RevocationPolicy, RevocationSet};
+pub use roots::{RootEntry, Roots};
+pub use store::{CatalogStore, iam_dir};
+pub use wallet::{WalletEntry, WalletStore};
 
 // Re-export the substrate types apps need so they can depend on `ce-iam` alone.
 pub use ce_cap::{Caveats, Resource, SignedCapability};
@@ -142,11 +148,17 @@ mod tests {
 
         // org → alice: all storage on any node.
         let root = simple_policy(
-            vec!["storage:read".into(), "storage:write".into(), "storage:list".into()],
+            vec![
+                "storage:read".into(),
+                "storage:write".into(),
+                "storage:list".into(),
+            ],
             ResourceMatch::Any,
             Conditions::default(),
         );
-        let g1 = iam.mint(&org, Principal(alice.node_id()), &root, 1).unwrap();
+        let g1 = iam
+            .mint(&org, Principal(alice.node_id()), &root, 1)
+            .unwrap();
 
         // alice → bob: only read, only on tag:gpu.
         let narrow = simple_policy(
@@ -154,26 +166,64 @@ mod tests {
             ResourceMatch::Tag("gpu".into()),
             Conditions::default(),
         );
-        let g2 = iam.attenuate(&alice, &g1, Principal(bob.node_id()), &narrow, 2).unwrap();
+        let g2 = iam
+            .attenuate(&alice, &g1, Principal(bob.node_id()), &narrow, 2)
+            .unwrap();
 
         let tags = vec!["gpu".to_string(), "linux".to_string()];
         // Bob can read on a gpu node...
-        assert!(iam
-            .verify(&org.node_id(), &tags, 0, &Principal(bob.node_id()), "storage:read", &g2.token, &|_, _| false)
-            .is_ok());
+        assert!(
+            iam.verify(
+                &org.node_id(),
+                &tags,
+                0,
+                &Principal(bob.node_id()),
+                "storage:read",
+                &g2.token,
+                &|_, _| false
+            )
+            .is_ok()
+        );
         // ...but cannot write (never delegated)...
-        assert!(iam
-            .verify(&org.node_id(), &tags, 0, &Principal(bob.node_id()), "storage:write", &g2.token, &|_, _| false)
-            .is_err());
+        assert!(
+            iam.verify(
+                &org.node_id(),
+                &tags,
+                0,
+                &Principal(bob.node_id()),
+                "storage:write",
+                &g2.token,
+                &|_, _| false
+            )
+            .is_err()
+        );
         // ...and cannot act on a non-gpu node.
-        assert!(iam
-            .verify(&org.node_id(), &["linux".to_string()], 0, &Principal(bob.node_id()), "storage:read", &g2.token, &|_, _| false)
-            .is_err());
+        assert!(
+            iam.verify(
+                &org.node_id(),
+                &["linux".to_string()],
+                0,
+                &Principal(bob.node_id()),
+                "storage:read",
+                &g2.token,
+                &|_, _| false
+            )
+            .is_err()
+        );
 
         // Revoke the root link → the whole subtree dies.
         let revset = RevocationSet::from_pairs([(org.node_id(), 1)]);
-        assert!(iam
-            .verify(&org.node_id(), &tags, 0, &Principal(bob.node_id()), "storage:read", &g2.token, &revset.predicate())
-            .is_err());
+        assert!(
+            iam.verify(
+                &org.node_id(),
+                &tags,
+                0,
+                &Principal(bob.node_id()),
+                "storage:read",
+                &g2.token,
+                &revset.predicate()
+            )
+            .is_err()
+        );
     }
 }
