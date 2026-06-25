@@ -63,6 +63,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod bridge;
 pub mod catalog;
 pub mod error;
 pub mod grant;
@@ -73,6 +74,19 @@ pub mod roots;
 pub mod store;
 pub mod wallet;
 
+// The lightweight half lives in `ce-iam-core`. Re-export it whole so existing consumers keep using
+// `ce_iam::device`, `ce_iam::secrets`, `ce_iam::Identity`, `ce_iam::Caveats`, etc. unchanged.
+pub use ce_iam_core as core;
+/// Device enrollment + the P-256<->NodeId binding (in `ce-iam-core`; re-exported as `ce_iam::device`).
+pub use ce_iam_core::device;
+/// The secrets vault (in `ce-iam-core`; re-exported as `ce_iam::secrets`).
+pub use ce_iam_core::secrets;
+pub use ce_iam_core::{
+    Device, DeviceKey, DeviceStore, MemStore, ROLE_ADMIN, ROLE_PENDING, RevokeOutcome, Store, Vault,
+};
+
+// The cap-minting bridge MINTS (needs the issuing core), so it stays in the big crate.
+pub use bridge::{ABILITY_OPERATOR, CapBridge, ability_for_aud};
 pub use catalog::{AuditEntry, Catalog, CatalogLog, CatalogOp, EffectiveGrant};
 pub use error::IamError;
 pub use grant::{Grant, Iam, LinkInfo, Scope, render_resource, simple_policy};

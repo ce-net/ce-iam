@@ -1,0 +1,42 @@
+[package]
+name = "ce-iam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "IAM/identity-and-access as a managed product over ce-cap: AWS-IAM-ish principals, roles, and policies mapped onto signed, attenuating CE capability chains. Re-exports ce-iam-core (identity + cap VERIFY + device enrollment + secrets vault) and adds minting/attenuation, policy/roles, catalog, wallet, roots, revocation, the device->cap bridge, and the CLI."
+keywords = ["ce", "iam", "capabilities", "authorization", "p2p"]
+categories = ["authentication", "api-bindings"]
+
+[[bin]]
+name = "ce-iam"
+path = "src/main.rs"
+
+[lib]
+name = "ce_iam"
+path = "src/lib.rs"
+
+[dependencies]
+# The lightweight half — re-exported so `ce_iam::{device, Identity, NodeId, Caveats, ...}` keeps working.
+ce-iam-core = { path = "../ce-iam-core" }
+
+# CE substrate (by path, per task).
+ce-cap = { workspace = true }
+ce-identity = { workspace = true }
+ce-rs = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+# Standard data-dir discovery (matches the CE node layout).
+directories = { workspace = true }
+# CLI + async runtime (binary only, but cheap to depend on).
+clap = { workspace = true }
+tokio = { workspace = true }
+# Raw HTTP for the one endpoint ce-rs does not wrap (POST /capabilities/revoke).
+reqwest = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

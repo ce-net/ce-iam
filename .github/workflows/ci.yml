@@ -19,6 +19,8 @@ jobs:
         with: { repository: ce-net/ce, path: ce }
       - uses: actions/checkout@v4
         with: { repository: ce-net/ce-pin, path: ce-pin }
+      - uses: actions/checkout@v4
+        with: { repository: ce-net/ce-secrets-rs, path: ce-secrets-rs }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: ce-iam }

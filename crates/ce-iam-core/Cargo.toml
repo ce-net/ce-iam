@@ -1,0 +1,29 @@
+[package]
+name = "ce-iam-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ce-iam-core — the lightweight half of CE IAM: identity + capability VERIFY (re-export ce-cap/ce-identity) + device enrollment + the secrets vault. Minimal deps; apps that only verify caps, hold secrets, and enroll devices depend on this and never compile the full IAM."
+keywords = ["ce", "iam", "capabilities", "secrets", "auth"]
+categories = ["authentication", "cryptography"]
+
+[lib]
+name = "ce_iam_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Primitives this crate re-exports (cap VERIFY + identity). VERIFY only — no minting lives here.
+ce-cap = { workspace = true }
+ce-identity = { workspace = true }
+# The byte-exact JS-vault crypto primitives the vault operations are built on.
+ce-secrets-rs = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync"] }

@@ -1,39 +1,39 @@
-[package]
-name = "ce-iam"
+# ce-iam workspace — the canonical CE identity / access / secrets system, split into two crates:
+#
+#   crates/ce-iam-core   SMALL / "basic auth": identity + capability VERIFY + device enrollment + the
+#                        secrets vault. Minimal deps, fast compile. Apps that only verify caps, hold
+#                        secrets, and enroll devices depend on THIS and never compile the full IAM.
+#   crates/ce-iam        BIG / full IAM: re-exports ce-iam-core and ADDS minting/attenuation, policy/
+#                        roles, catalog, wallet, roots, revocation, the device->cap bridge, and the CLI.
+#
+# Rule (locked, docs/MERGE.md): device + secrets + cap-VERIFY live in ce-iam-core; minting/policy/roles
+# live in ce-iam. Splitting the package keeps the lightweight surface lightweight.
+
+[workspace]
+resolver = "2"
+members = ["crates/ce-iam-core", "crates/ce-iam"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "IAM/identity-and-access as a managed product over ce-cap: AWS-IAM-ish principals, roles, and policies mapped onto signed, attenuating CE capability chains."
 license = "MIT"
 authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
 repository = "https://github.com/ce-net/ce-iam"
-keywords = ["ce", "iam", "capabilities", "authorization", "p2p"]
-categories = ["authentication", "api-bindings"]
 
-[[bin]]
-name = "ce-iam"
-path = "src/main.rs"
-
-[lib]
-name = "ce_iam"
-path = "src/lib.rs"
-
-[dependencies]
-# CE substrate (by path, per task).
+[workspace.dependencies]
+# CE substrate primitives (by path; ce-build mirrors the path layout onto the build node).
 ce-cap = { path = "../ce/crates/ce-cap" }
 ce-identity = { path = "../ce/crates/ce-identity" }
 ce-rs = { path = "../ce-rs" }
+# The byte-exact JS-vault interop primitives the secrets module is grown from.
+ce-secrets-rs = { path = "../ce-secrets-rs" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
-# Standard data-dir discovery (matches the CE node layout).
 directories = "5"
-# CLI + async runtime (binary only, but cheap to depend on).
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-# Raw HTTP for the one endpoint ce-rs does not wrap (POST /capabilities/revoke).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-[dev-dependencies]
 proptest = "1"
