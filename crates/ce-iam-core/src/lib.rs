@@ -20,8 +20,12 @@
 //! (init / recover / enroll / pair / seal / open / grant) are ported here over a pluggable async
 //! [`secrets::Store`] so the same logic runs over an in-memory map (tests) or a mesh KV (production).
 
+pub mod attestation;
 pub mod device;
 pub mod secrets;
+
+// Real-world identity attestations (BankID/Google/OIDC bind a node to a verified human).
+pub use attestation::{max_level, Attestation, AttestationBody, Claim};
 
 // Device enrollment (folded in from the former ce-auth crate's store.rs).
 pub use device::{Device, DeviceStore, ROLE_ADMIN, ROLE_PENDING, RevokeOutcome};

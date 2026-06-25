@@ -205,6 +205,7 @@ dependencies = [
  "ce-iam-core",
  "ce-identity",
  "ce-rs",
+ "ce-secrets-rs",
  "clap",
  "directories",
  "hex",

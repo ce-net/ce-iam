@@ -123,14 +123,14 @@ pub fn max_level(attestations: &[Attestation], now: u64) -> u8 {
 mod tests {
     use super::*;
 
-    fn id() -> Identity {
-        Identity::generate()
+    fn id(seed: u8) -> Identity {
+        Identity::from_secret_bytes(&[seed; 32])
     }
 
     #[test]
     fn issue_then_verify_roundtrips() {
-        let provider = id();
-        let subject = id().node_id();
+        let provider = id(1);
+        let subject = id(2).node_id();
         let a = Attestation::issue(
             &provider, subject, Claim::UniqueHuman, LEVEL_STRONG_EID, [7u8; 32], 1000, 2000, 1,
         );
@@ -140,32 +140,32 @@ mod tests {
 
     #[test]
     fn expired_is_rejected() {
-        let p = id();
-        let a = Attestation::issue(&p, id().node_id(), Claim::UniqueHuman, 3, [0u8; 32], 1000, 2000, 1);
+        let p = id(1);
+        let a = Attestation::issue(&p, id(2).node_id(), Claim::UniqueHuman, 3, [0u8; 32], 1000, 2000, 1);
         assert!(a.verify(2001).is_err(), "expired must fail");
         assert!(a.verify(0).is_ok(), "before expiry must pass");
     }
 
     #[test]
     fn tampered_body_breaks_signature() {
-        let p = id();
-        let mut a = Attestation::issue(&p, id().node_id(), Claim::UniqueHuman, 1, [0u8; 32], 0, 0, 1);
+        let p = id(1);
+        let mut a = Attestation::issue(&p, id(2).node_id(), Claim::UniqueHuman, 1, [0u8; 32], 0, 0, 1);
         a.body.level = 3; // forge a higher assurance level
         assert!(a.verify(1).is_err(), "tampering must invalidate the signature");
     }
 
     #[test]
     fn wrong_provider_key_fails() {
-        let p = id();
-        let mut a = Attestation::issue(&p, id().node_id(), Claim::UniqueHuman, 3, [0u8; 32], 0, 0, 1);
-        a.body.provider = id().node_id(); // claim a different provider
+        let p = id(1);
+        let mut a = Attestation::issue(&p, id(2).node_id(), Claim::UniqueHuman, 3, [0u8; 32], 0, 0, 1);
+        a.body.provider = id(3).node_id(); // claim a different provider
         assert!(a.verify(1).is_err(), "signature must not verify under a different provider");
     }
 
     #[test]
     fn max_level_picks_strongest_valid() {
-        let p = id();
-        let s = id().node_id();
+        let p = id(1);
+        let s = id(2).node_id();
         let weak = Attestation::issue(&p, s, Claim::EmailVerified("h".into()), LEVEL_EMAIL, [0u8; 32], 0, 0, 1);
         let strong = Attestation::issue(&p, s, Claim::UniqueHuman, LEVEL_STRONG_EID, [1u8; 32], 0, 0, 2);
         assert_eq!(max_level(&[weak, strong], 1), LEVEL_STRONG_EID);
