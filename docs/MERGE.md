@@ -103,5 +103,26 @@ An app that only verifies caps + holds secrets depends on the small crate and ne
     `{get,put,del,list}` store (the snapshot bridge syncs the wasm in-memory store to the durable mesh
     KV). Same verbs ce-cast's `vault.mjs`/`delivery.ts` use, so ce-cast swaps its vendored vault for
     this. `npm run build` + `npm test` green (6 tests incl. golden parity SDK->wasm->ce-iam-core).
-- **Phases 3, 5 (pending):** unified CLI verbs for device/secret; lock + retire ce-auth/ce-secrets-rs;
-  ce-cast's `src/vault/*` actually swapped to import `@ce-net/iam`.
+- **Phase 3 (done):** unified `ce-iam` CLI with `device` (claim/request/list/approve/revoke) and
+  `secret` (init/recover/gen/put/get/rotate/list/rm/grant/use) verbs over the core, documented in
+  the README CLI section.
+- **Phase 5 (done):** locked.
+  - Tests: every vault verb has a test; added the round trip (enroll second device -> put secret ->
+    wipe store -> owner recovers from its key alone -> read), default-deny (unenrolled can't
+    read/grant), device revocation (revoked device loses master; anti-lockout), and tamper-evidence
+    (forged device record can't authenticate the real proof). 179 green on the relay incl. the 9
+    golden vectors. The golden-vector gate is a normal `cargo test --all`, so it runs in CI and fails
+    if Rust diverges from the committed `crypto.mjs`-derived fixtures.
+  - Security: `SECURITY.md` now has the locked-invariant checklist (attenuation never broadens,
+    master derived-but-wrapped, default-deny, records signed by the writer, one durable owner-pinned
+    store, offline verify) mapped to enforcement, the vault trust model, and an honest boundaries list.
+  - Docs: README documents the merged system + the two crates + CLI + the Rust/wasm/TS SDKs, and
+    cross-links this file.
+  - Retire the old: deprecation notes on `ce-secrets-rs` (now the crypto primitive layer beneath
+    `ce-iam-core::secrets`, still the audited interop core) and `ce-secrets` (superseded by `ce-iam`;
+    kept as the JS golden-vector reference). The one-line ce-cast swap is noted in
+    `ce-cast/web/src/vault/delivery.ts`. No repos deleted.
+- **Deferred (honest):** mesh replication of the catalog op-log (single-node durable today); master
+  re-key on device revocation; on-chain vault-grant revocation list; ce-cast actually importing
+  `@ce-net/iam` (the swap is a one-liner, noted in place, not yet flipped); keypair secret types in
+  the Rust `secret gen` CLI.

@@ -6,6 +6,27 @@ All notable changes to `ce-iam`. Format loosely follows Keep a Changelog.
 
 ### Added
 
+- **The merge, locked (Phase 5).** ce-iam is now the one identity + access + secrets system, split
+  into a small `ce-iam-core` ("basic auth": cap-verify + device enrollment + the secrets vault) and
+  the big `ce-iam` (mint/attenuate/policy/roles/catalog/wallet/roots/revocation/bridge + CLI). See
+  `docs/MERGE.md`.
+- **Secrets vault tests**: a full round trip (enroll a second device → put a secret → wipe the store
+  → owner recovers from its key alone → read), default-deny (an unenrolled device can neither read
+  nor issue grants), device revocation (revoked device loses master access; the in-use device cannot
+  be revoked), and tamper-evidence (a forged device record cannot authenticate the real device's
+  challenge proof). The golden-vector parity gate against `ce-secrets/src/crypto.mjs` runs in CI via
+  `cargo test --all`.
+- **Security checklist** in `SECURITY.md`: the locked invariants (attenuation never broadens, master
+  derived-but-wrapped, default-deny, records signed by the writer, one durable owner-pinned store,
+  offline verify) mapped to where each is enforced, plus the vault trust model and an honest list of
+  boundaries (the store is not write-authenticated; no master re-key on revoke; single-store grant
+  revocation).
+- **Docs**: README now documents the merged system, the two crates, the `device`/`secret` CLI verbs,
+  and the Rust + wasm (`ce-iam-core-wasm`) + TS (`@ce-net/iam`) SDKs, cross-linking `docs/MERGE.md`.
+- **Deprecation notes** on the retired-but-kept upstreams: `ce-secrets-rs` (now the crypto primitive
+  layer beneath `ce-iam-core::secrets`) and `ce-secrets` (the JS golden-vector reference); the
+  one-line ce-cast swap to `@ce-net/iam` is noted in `ce-cast/web/src/vault/delivery.ts`.
+
 - **Durable catalog store** (`store::CatalogStore`): an on-disk, op-logged role/policy catalog at
   `<data_dir>/iam/catalog.json`. The live catalog is reconstructed by replaying the log on load; this
   is the durable writer half of the ce-coord replicated-map model. Atomic writes (temp-file + fsync +
