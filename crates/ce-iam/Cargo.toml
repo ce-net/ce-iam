@@ -25,6 +25,9 @@ ce-iam-core = { path = "../ce-iam-core" }
 ce-cap = { workspace = true }
 ce-identity = { workspace = true }
 ce-rs = { workspace = true }
+# Byte-exact vault crypto primitives — used by the CLI's `secret gen` to mint secret material
+# (token/password/base64/uuid/aes-256/hex) the same way `ce-secrets/src/crypto.mjs` does.
+ce-secrets-rs = { workspace = true }
 
 anyhow = { workspace = true }
 serde = { workspace = true }

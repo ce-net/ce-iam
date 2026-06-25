@@ -10,6 +10,10 @@
 //!   * `role`     — manage the durable role/policy catalog (put/get/list/rm, attach/detach, …).
 //!   * `wallet`   — store, list, show, and remove held grant tokens.
 //!   * `root`     — manage and rotate accepted root keys.
+//!   * `device`   — enroll/manage this operator's devices (claim/request/list/approve/revoke) over the
+//!                  `ce-iam-core` [`DeviceStore`] + the P-256<->NodeId cap bridge.
+//!   * `secret`   — the secrets vault (gen/put/get/rotate/list/rm/grant/use) over the
+//!                  `ce-iam-core` [`Vault`] on the mesh ce-kv store. A secret value is NEVER printed.
 //!
 //! Money is never printed as a float; capability conditions use whole-credit ceilings. Output is
 //! plain, scriptable text (and `--json` where structured output helps). No emojis.
@@ -17,9 +21,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ce_iam::Identity;
 use ce_iam::{
-    CachedRevocationSet, CatalogStore, Conditions, Iam, Policy, Principal, ResourceMatch,
-    RevocationPolicy, RevocationSet, Role, Roots, WalletStore, ce_cloud_action_universe, iam_dir,
-    simple_policy,
+    CachedRevocationSet, CatalogStore, Conditions, DeviceKey, DeviceStore, Iam, MeshKvStore, Policy,
+    Principal, ResourceMatch, RevocationPolicy, RevocationSet, Role, Roots, Vault, WalletStore,
+    ce_cloud_action_universe, device::RevokeOutcome, iam_dir, simple_policy,
 };
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -69,6 +73,13 @@ enum Command {
     /// Manage and rotate accepted root keys.
     #[command(subcommand)]
     Root(RootCmd),
+    /// Enroll and manage this operator's devices (the P-256<->NodeId device registry).
+    #[command(subcommand)]
+    Device(DeviceCmd),
+    /// The secrets vault: generate/store/rotate/reveal secrets and grant apps read access. A secret
+    /// value is NEVER printed.
+    #[command(subcommand)]
+    Secret(SecretCmd),
 }
 
 #[derive(Args)]
@@ -401,6 +412,188 @@ struct RootReissueArgs {
     json: bool,
 }
 
+// ---- device subcommand (over ce_iam_core::DeviceStore + the cap bridge) ---------------------------
+
+#[derive(Subcommand)]
+enum DeviceCmd {
+    /// TOFU first claim: become the admin device if no admin exists yet (binds this node id).
+    Claim(DeviceClaimArgs),
+    /// Request enrollment as a pending device (an admin approves it).
+    Request(DeviceRequestArgs),
+    /// List enrolled/pending devices.
+    List(DeviceListArgs),
+    /// Approve a pending device, promoting it to admin.
+    Approve(DeviceIdArgs),
+    /// Revoke (remove) a device. The last admin cannot be revoked.
+    Revoke(DeviceIdArgs),
+}
+
+#[derive(Args)]
+struct DeviceClaimArgs {
+    /// The device id to claim as admin.
+    device_id: String,
+    /// The device's compact ECDSA pub (base64url of 04||x||y) used to authenticate it.
+    #[arg(long = "pub")]
+    pub_b64: String,
+    /// The device's CE NodeId (64-hex) — the cap principal a minted grant binds to. Defaults to this
+    /// machine's node id.
+    #[arg(long)]
+    node_id: Option<String>,
+}
+
+#[derive(Args)]
+struct DeviceRequestArgs {
+    /// The device id requesting enrollment.
+    device_id: String,
+    /// The device's compact ECDSA pub (base64url of 04||x||y).
+    #[arg(long = "pub")]
+    pub_b64: String,
+    /// The device's CE NodeId (64-hex). Defaults to this machine's node id.
+    #[arg(long)]
+    node_id: Option<String>,
+    /// A human label for the device.
+    #[arg(long, default_value = "")]
+    label: String,
+}
+
+#[derive(Args)]
+struct DeviceListArgs {
+    /// Emit JSON instead of plain text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DeviceIdArgs {
+    /// The device id.
+    device_id: String,
+}
+
+// ---- secret subcommand (over ce_iam_core::secrets::Vault on the mesh ce-kv store) -----------------
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Establish the vault on this (owner) device, or re-enroll the owner. Idempotent.
+    Init(SecretInitArgs),
+    /// Re-establish the vault from THIS owner key alone (re-derives the master). Owner is never locked
+    /// out, even after a store wipe.
+    Recover(SecretInitArgs),
+    /// Generate + store a secret under a name by type (the value is never displayed).
+    Gen(SecretGenArgs),
+    /// Store an existing secret value from stdin under a name (never echoed).
+    Put(SecretPutArgs),
+    /// Reveal a secret's raw value — for piping/injection only. Refuses a TTY unless --force.
+    Get(SecretGetArgs),
+    /// Generate a fresh value for an existing secret, bumping its version.
+    Rotate(SecretNameArgs),
+    /// List secret names + type + version + fingerprint (never values).
+    List(SecretListArgs),
+    /// Delete a named secret.
+    Rm(SecretNameArgs),
+    /// Issue a signed read-grant to an app/audience for one or more secrets.
+    Grant(SecretGrantArgs),
+    /// Run a command with named secrets injected as environment variables.
+    Use(SecretUseArgs),
+}
+
+/// Shared flags selecting the vault: namespace + which CE node to reach the mesh ce-kv through.
+#[derive(Args, Clone)]
+struct VaultArgs {
+    /// Vault namespace (folds into the owner-master derivation salt and the ce-kv topic). Defaults to
+    /// this device id, giving each operator a private vault.
+    #[arg(long, global = true)]
+    ns: Option<String>,
+    /// The CE node HTTP base to reach the mesh ce-kv service through. Defaults to --node.
+    #[arg(long, global = true)]
+    kv_node: Option<String>,
+}
+
+#[derive(Args)]
+struct SecretInitArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// A label for this device in the vault.
+    #[arg(long, default_value = "")]
+    label: String,
+}
+
+#[derive(Args)]
+struct SecretGenArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Secret name.
+    name: String,
+    /// Secret type: token, hex, password, base64, uuid, aes-256 (keypair types are not yet supported
+    /// in the Rust CLI — see the gap notes).
+    #[arg(long = "type", default_value = "token")]
+    kind: String,
+    /// Length in bytes for length-bearing types (token/hex/password/base64).
+    #[arg(long)]
+    length: Option<usize>,
+}
+
+#[derive(Args)]
+struct SecretPutArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Secret name.
+    name: String,
+    /// Type label recorded with the secret.
+    #[arg(long = "type", default_value = "opaque")]
+    kind: String,
+}
+
+#[derive(Args)]
+struct SecretGetArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Secret name.
+    name: String,
+    /// Emit the raw value to a TTY anyway (by default revealing to a terminal is refused).
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Args)]
+struct SecretNameArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Secret name.
+    name: String,
+}
+
+#[derive(Args)]
+struct SecretListArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Emit JSON instead of plain text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct SecretGrantArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// The app/audience receiving read access.
+    audience: String,
+    /// Comma-separated secret names to grant read access to.
+    #[arg(long)]
+    read: String,
+    /// Optional ISO-8601 expiry timestamp (e.g. 2026-12-31T00:00:00.000Z).
+    #[arg(long)]
+    expires: Option<String>,
+}
+
+#[derive(Args)]
+struct SecretUseArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// Secret names to inject, followed by `--` and the command to run.
+    #[arg(trailing_var_arg = true, required = true)]
+    rest: Vec<String>,
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -497,6 +690,8 @@ async fn main() -> Result<()> {
         Command::Role(r) => cmd_role(&cli, r),
         Command::Wallet(w) => cmd_wallet(&cli, w),
         Command::Root(r) => cmd_root(&cli, r),
+        Command::Device(d) => cmd_device(&cli, d),
+        Command::Secret(s) => cmd_secret(&cli, s).await,
     }
 }
 
@@ -1092,4 +1287,369 @@ fn cmd_root(cli: &Cli, r: &RootCmd) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ---- device commands -----------------------------------------------------------------------------
+
+/// Open the operator's device registry under the IAM data dir (`<iam>/devices.json`), no env seeds.
+fn open_device_store(cli: &Cli) -> Result<DeviceStore> {
+    let dir = iam_dir(cli.data_dir.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    DeviceStore::open(&dir, &[]).context("opening device store")
+}
+
+/// Resolve the CE NodeId to bind a device to: an explicit 64-hex, else this machine's node id.
+fn resolve_node_id(cli: &Cli, explicit: &Option<String>) -> Result<String> {
+    match explicit {
+        Some(s) => {
+            // Validate it parses as a principal so we never persist a malformed binding.
+            Principal::parse(s).context("parsing --node-id")?;
+            Ok(s.clone())
+        }
+        None => Ok(load_identity(&cli.data_dir)?.node_id_hex()),
+    }
+}
+
+fn cmd_device(cli: &Cli, d: &DeviceCmd) -> Result<()> {
+    match d {
+        DeviceCmd::Claim(a) => {
+            let node_id = resolve_node_id(cli, &a.node_id)?;
+            let store = open_device_store(cli)?;
+            if store.claim(&a.device_id, &a.pub_b64, &node_id)? {
+                println!("claimed device '{}' as admin (node_id={node_id})", a.device_id);
+                Ok(())
+            } else {
+                bail!("an admin device already exists — use `device request` then `device approve`");
+            }
+        }
+        DeviceCmd::Request(a) => {
+            let node_id = resolve_node_id(cli, &a.node_id)?;
+            let store = open_device_store(cli)?;
+            let role = store.request(&a.device_id, &a.pub_b64, &node_id, &a.label)?;
+            println!("device '{}' is now {role} (node_id={node_id})", a.device_id);
+            Ok(())
+        }
+        DeviceCmd::List(a) => {
+            let store = open_device_store(cli)?;
+            let devices = store.list();
+            if a.json {
+                let rows: Vec<_> = devices
+                    .iter()
+                    .map(|(id, dev)| {
+                        serde_json::json!({
+                            "id": id,
+                            "role": dev.role,
+                            "label": dev.label,
+                            "node_id": dev.node_id,
+                            "added_ts": dev.added_ts,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if devices.is_empty() {
+                println!("(no devices enrolled — run `device claim`)");
+            } else {
+                for (id, dev) in &devices {
+                    println!(
+                        "{id}  {}  {}  node_id={}",
+                        dev.role,
+                        if dev.label.is_empty() { "-" } else { &dev.label },
+                        if dev.node_id.is_empty() { "-" } else { &dev.node_id }
+                    );
+                }
+            }
+            Ok(())
+        }
+        DeviceCmd::Approve(a) => {
+            let store = open_device_store(cli)?;
+            if store.approve(&a.device_id)? {
+                println!("approved device '{}' (now admin)", a.device_id);
+                Ok(())
+            } else {
+                bail!("no pending device '{}' to approve", a.device_id);
+            }
+        }
+        DeviceCmd::Revoke(a) => {
+            let store = open_device_store(cli)?;
+            match store.revoke(&a.device_id)? {
+                RevokeOutcome::Removed => {
+                    println!("revoked device '{}'", a.device_id);
+                    Ok(())
+                }
+                RevokeOutcome::NotFound => bail!("no such device '{}'", a.device_id),
+                RevokeOutcome::LastAdmin => {
+                    bail!("refusing to revoke the last admin device (would lock the operator out)")
+                }
+            }
+        }
+    }
+}
+
+// ---- secret commands (the vault) -----------------------------------------------------------------
+
+/// Persist/load this operator's vault device key under `<iam>/secrets-device.json` (mode 0600), the
+/// Rust analogue of ce-secrets' `loadOrCreateDeviceKey`. The same P-256 device identity is reused
+/// across invocations so the owner keeps reading their vault.
+fn load_or_create_device_key(cli: &Cli) -> Result<DeviceKey> {
+    let dir = iam_dir(cli.data_dir.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("secrets-device.json");
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        if !raw.trim().is_empty() {
+            return DeviceKey::from_json(&raw).context("parse device key");
+        }
+    }
+    let dk = DeviceKey::generate().context("generate device key")?;
+    let json = dk.to_json()?;
+    std::fs::write(&path, json.as_bytes()).with_context(|| format!("write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    eprintln!("(generated this device's vault key in {})", path.display());
+    Ok(dk)
+}
+
+/// Build a [`Vault`] over the mesh ce-kv store for the given vault flags. The namespace defaults to
+/// the device id (a private per-operator vault); the kv node defaults to `--node`.
+fn open_vault(cli: &Cli, v: &VaultArgs) -> Result<Vault<MeshKvStore>> {
+    let device = load_or_create_device_key(cli)?;
+    let ns = v.ns.clone().unwrap_or_else(|| device.id.clone());
+    let kv_node = v.kv_node.clone().unwrap_or_else(|| cli.node.clone());
+    let token = ce_rs::discover_api_token();
+    let store = MeshKvStore::connect(&ns, kv_node, token);
+    Ok(Vault::new(store, device, ns))
+}
+
+/// Generate secret material for a type, mirroring `ce-secrets/src/crypto.mjs::generate`. Returns the
+/// canonical STRING form (as bytes) so revealing it yields a clean, usable value.
+fn generate_secret_material(kind: &str, length: Option<usize>) -> Result<Vec<u8>> {
+    use ce_secrets_rs::encoding::{b64url_encode, hex_encode};
+    let kind = kind.to_lowercase();
+    let s = match kind.as_str() {
+        "token" | "hex" => {
+            let n = length.unwrap_or(32);
+            let mut b = vec![0u8; n];
+            ce_secrets_rs::fill_random(&mut b);
+            hex_encode(&b)
+        }
+        "password" | "pass" => {
+            const PW: &[u8] =
+                b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*-_=+";
+            let n = length.unwrap_or(24);
+            let mut r = vec![0u8; n];
+            ce_secrets_rs::fill_random(&mut r);
+            r.iter().map(|b| PW[(*b as usize) % PW.len()] as char).collect()
+        }
+        "base64" => {
+            let n = length.unwrap_or(32);
+            let mut b = vec![0u8; n];
+            ce_secrets_rs::fill_random(&mut b);
+            b64url_encode(&b)
+        }
+        "uuid" => uuid_v4(),
+        "aes-256" | "aes256" => {
+            let mut b = [0u8; 32];
+            ce_secrets_rs::fill_random(&mut b);
+            hex_encode(&b)
+        }
+        other => bail!(
+            "unsupported secret type '{other}'. Supported: token, hex, password, base64, uuid, \
+             aes-256. (Keypair types ed25519/x25519/rsa-* require WebCrypto key export and are not \
+             yet ported to the Rust CLI — generate them with the JS `ce-secrets` for now.)"
+        ),
+    };
+    Ok(s.into_bytes())
+}
+
+/// A random RFC-4122 v4 UUID string — the analogue of `crypto.randomUUID()`.
+fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    ce_secrets_rs::fill_random(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+    let h = ce_secrets_rs::encoding::hex_encode(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+async fn cmd_secret(cli: &Cli, s: &SecretCmd) -> Result<()> {
+    match s {
+        SecretCmd::Init(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            if vault.init(&a.label).await? {
+                println!("vault created; this device ({}) is enrolled as owner.", vault.device().id);
+            } else if vault.is_enrolled().await? {
+                println!("vault already exists; this device is already enrolled.");
+            } else {
+                println!(
+                    "a vault already exists. run `secret recover` to re-establish from this owner \
+                     key, or pair this device from a trusted one."
+                );
+            }
+            Ok(())
+        }
+        SecretCmd::Recover(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            vault.recover(&a.label).await?;
+            println!("vault recovered; this device ({}) is the owner and re-enrolled.", vault.device().id);
+            Ok(())
+        }
+        SecretCmd::Gen(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            let material = generate_secret_material(&a.kind, a.length)?;
+            let meta = vault.put_secret(&a.name, &material, &a.kind).await?;
+            println!(
+                "stored {}  type={}  v{}  fp={}  (value never displayed)",
+                meta.name, meta.kind, meta.version, meta.fp
+            );
+            Ok(())
+        }
+        SecretCmd::Put(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            let value = read_secret_value()?;
+            if value.is_empty() {
+                bail!("empty value");
+            }
+            let meta = vault.put_secret(&a.name, value.as_bytes(), &a.kind).await?;
+            println!("stored {}  v{}  fp={}  (not displayed)", meta.name, meta.version, meta.fp);
+            Ok(())
+        }
+        SecretCmd::Get(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            // Refuse to reveal onto an interactive terminal unless forced (no accidental shoulder-leak).
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) && !a.force {
+                bail!(
+                    "refusing to print a secret to a terminal; pipe it (e.g. `... | cat`) or pass \
+                     --force. Prefer `secret use` to inject without revealing."
+                );
+            }
+            let revealed = vault.get_secret(&a.name).await?;
+            use std::io::Write;
+            std::io::stdout().write_all(&revealed.bytes).context("writing secret to stdout")?;
+            Ok(())
+        }
+        SecretCmd::Rotate(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            // Re-derive material of the SAME stored type, bumping the version.
+            let existing = vault.get_secret(&a.name).await.context("no such secret to rotate")?;
+            let material = generate_secret_material(&existing.kind, None)?;
+            let meta = vault.put_secret(&a.name, &material, &existing.kind).await?;
+            println!("rotated {} -> v{}  fp={}  (not displayed)", meta.name, meta.version, meta.fp);
+            Ok(())
+        }
+        SecretCmd::List(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            let list = vault.list_secrets().await?;
+            if a.json {
+                let rows: Vec<_> = list
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name, "type": m.kind, "version": m.version,
+                            "fp": m.fp, "public": m.public, "created_at": m.created_at,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if list.is_empty() {
+                println!("(no secrets yet — `secret gen <name> --type token`)");
+            } else {
+                for m in &list {
+                    println!("{:<24} {:<12} v{}  fp={}", m.name, m.kind, m.version, m.fp);
+                }
+            }
+            Ok(())
+        }
+        SecretCmd::Rm(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            vault.delete_secret(&a.name).await?;
+            println!("deleted secret '{}'", a.name);
+            Ok(())
+        }
+        SecretCmd::Grant(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            let read: Vec<String> = a
+                .read
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+            if read.is_empty() {
+                bail!("--read <name,name> required");
+            }
+            let g = vault.issue_grant(&a.audience, &read, a.expires.clone()).await?;
+            println!("granted {}: read {}", a.audience, read.join(", "));
+            println!("grant id: {}", g.id);
+            println!("token (give this to the app):\n{}", g.token);
+            Ok(())
+        }
+        SecretCmd::Use(a) => {
+            // Split `rest` at `--` into [names...] -- [command...].
+            let split = a.rest.iter().position(|x| x == "--");
+            let (names, command): (&[String], &[String]) = match split {
+                Some(i) => (&a.rest[..i], &a.rest[i + 1..]),
+                None => bail!("usage: secret use <name…> -- <command…>"),
+            };
+            if names.is_empty() || command.is_empty() {
+                bail!("need at least one <name> and a command after --");
+            }
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            let mut cmd = std::process::Command::new(&command[0]);
+            cmd.args(&command[1..]);
+            for name in names {
+                let revealed = vault.get_secret(name).await.with_context(|| format!("reveal {name}"))?;
+                cmd.env(env_name(name), String::from_utf8_lossy(&revealed.bytes).into_owned());
+            }
+            let status = cmd.status().with_context(|| format!("spawning {}", command[0]))?;
+            std::process::exit(status.code().unwrap_or(0));
+        }
+    }
+}
+
+/// Deny secret-writing ops unless this device is enrolled (mirrors the JS `enrolledCtx`).
+async fn require_enrolled(vault: &Vault<MeshKvStore>) -> Result<()> {
+    if vault.is_enrolled().await? {
+        return Ok(());
+    }
+    if !vault.exists().await? {
+        bail!("no vault yet — run `secret init`");
+    }
+    bail!("this device is not enrolled — pair it and approve it from a trusted device");
+}
+
+/// Map a secret name to an env var name: uppercased, non-alphanumerics -> `_` (matches `envName`).
+fn env_name(name: &str) -> String {
+    name.to_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Read a secret value: from stdin if piped, else prompt on the TTY (best-effort, line-based).
+fn read_secret_value() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut s = String::new();
+        stdin.lock().read_line(&mut s).context("reading value from stdin")?;
+        return Ok(s.trim_end_matches(['\r', '\n']).to_string());
+    }
+    eprint!("paste value (visible): ");
+    std::io::stderr().flush().ok();
+    let mut s = String::new();
+    stdin.lock().read_line(&mut s).context("reading value")?;
+    Ok(s.trim_end_matches(['\r', '\n']).to_string())
 }
