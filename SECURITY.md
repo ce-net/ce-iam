@@ -1,7 +1,23 @@
 # ce-iam security model
 
-ce-iam is authorization over CE capabilities. This document states the trust model a verifier relies
-on, what an operator must configure to be safe, and the known boundaries.
+ce-iam is the merged identity + access + secrets system: **capabilities** (mint/attenuate/verify over
+`ce-cap`), **device enrollment** (the P-256 device ↔ Ed25519 NodeId bridge), and the **secrets vault**
+(owner-derived, per-device-wrapped master). This document states the trust model each layer relies on,
+what an operator must configure to be safe, and the known boundaries. It is honest about what is
+*enforced by the code* versus what depends on operator configuration or is deferred.
+
+## The Phase-5 security checklist (the locked invariants)
+
+| invariant | enforced where | status |
+|---|---|---|
+| **Attenuation never broadens** — a child cap link's abilities ⊆, resource ⊆, caveats ⊇ the parent. | `ce_cap::authorize`, exercised by `Iam::verify`; property-tested in `tests/prop_attenuation.rs` (depths 2–3, randomized). | **Enforced.** |
+| **Master derived-but-wrapped** — the vault master is HKDF-derived from the owner's ECDH scalar (recoverable by the owner alone) AND ECIES-wrapped per enrolled device (readable without re-deriving). | `secrets::Vault::{recover, enroll, load_master}`; golden-vectored against `crypto.mjs`. | **Enforced.** |
+| **Default-deny** — no enrollment ⇒ no master ⇒ no read and no grant issuance; an unknown principal/action is `Err`, never a panic. | `Vault::{load_master, get_secret, issue_grant}`; `Iam::verify`. Tested: `unenrolled_device_cannot_read_or_grant`, `verify_malformed_token_exits_nonzero_no_panic`. | **Enforced.** |
+| **Records signed by the writer** — every device/secret/grant record carries an ECDSA signature over the canonical body; the signer's enrolled key is checked on verify. | `secrets::Vault` (`sign_record` on write; `verify_record` + enrolled-key match on `verify_grant`/`verify_auth`). Tested: `tampered_record_signature_is_detectable`. | **Enforced for verify paths.** See boundary below: the *store itself* is not write-authenticated. |
+| **One durable owner-pinned store** — the vault is generic over an async `Store`; production points it at a single mesh KV (`MeshKvStore` / ce-kv) keyed by the owner namespace, not a mutable hub KV. | `secrets::Store` trait; `ce_iam::MeshKvStore`. | **Mechanism enforced; the operator must point it at the durable backend** (the CLI defaults to the mesh ce-kv node). |
+| **Offline verify** — a presented capability or vault grant is checked with no policy server; the token *is* the proof. | `Iam::verify` (offline but for revocation), `Vault::{verify_grant, verify_auth}`. | **Enforced** (revocation freshness is the one online input — see below). |
+
+## What a capability is
 
 ## What a capability is
 
@@ -58,6 +74,35 @@ To rotate an org root without flag-day downtime:
 
 Validity windows are enforced by `Roots::accepted_at(now)`; feed it to the verifier (`--use-roots`).
 
+## The secrets vault trust model
+
+The vault (`ce-iam-core::secrets`) is a symmetric secret store, orthogonal to capability authority.
+A verifier/operator relies on:
+
+1. **Master secrecy.** The 32-byte vault master encrypts every secret (AES-256-GCM). It is HKDF-derived
+   from the OWNER device's ECDH private scalar (salt `ce-vault:<ns>`, info `master-v1`), so the owner
+   can re-establish the vault from its key alone after a total store wipe (`recover`, tested by
+   `full_roundtrip_enroll_put_recover_read`). It is also ECIES-wrapped to each enrolled device's ECDH
+   public key, so other devices read without re-deriving. **An attacker who obtains the owner's ECDH
+   private key obtains the master and every secret** — the owner key is the root of this layer; protect
+   it exactly as the CE node key.
+2. **Enrollment is the gate.** Reading a secret or issuing a grant requires a `d.<id>` enrollment
+   record this device can unwrap. A device that never enrolled has no master and is denied (default-
+   deny). Pairing is owner-mediated: a new device publishes a request, an *already-enrolled* device
+   approves it by wrapping the master to the newcomer's key.
+3. **Revocation = de-enrollment.** `revoke_device` deletes the `d.<id>` record; the revoked device can
+   no longer load the master (tested by `revoked_device_loses_access`). The vault refuses to revoke the
+   device you are using (anti-lockout). **Caveat (honest):** revocation does not re-key the master, so a
+   device that already cached the master before revocation retains whatever it copied. Rotate
+   high-value secrets after revoking a device; full master rotation is deferred (see boundaries).
+4. **Record integrity.** Device, secret, and grant records are ECDSA-signed by the writing device, and
+   the signer's key is checked against its enrolled record on `verify_grant`/`verify_auth` (tested by
+   `tampered_record_signature_is_detectable`). This makes tampering *detectable on the verify paths*.
+5. **Grant scope.** A vault grant (`issue_grant`) authorizes `read:<name>` (or `read:*`) for one
+   audience with an optional expiry; `verify_grant` requires the issuer be an enrolled device, the grant
+   not deleted (revoked), not expired, audience-matched, and ability-matched. Only an enrolled device
+   may issue.
+
 ## DoS resistance
 
 A service that calls `verify` on remote-supplied tokens is exposed to malicious input. ce-iam bounds
@@ -73,6 +118,19 @@ always an `Err`, never a panic (property-tested).
 - **Catalog replication is single-node.** The durable op-log is real; mesh broadcast / multi-node
   convergence is deferred (see README). Treat the catalog as authoritative only on its writer node.
 - **Condition keys are the closed caveat set.** No source-IP / MFA / arbitrary CEL operators.
+- **The vault store is not write-authenticated by the store itself.** Integrity comes from per-record
+  signatures verified on the *verify* paths, not from the KV refusing unauthorized writes. A malicious
+  store can delete or roll back records (a DoS / availability attack), and on read paths that do not
+  re-verify the writer signature (e.g. `get_secret` trusts the sealed body decrypts under the master) it
+  relies on the AEAD tag, not a record signature. Point the vault at a store you trust for availability;
+  treat record signatures as tamper-*evidence*, not write-prevention.
+- **No master re-keying on device revocation.** De-enrollment removes future access; it does not rotate
+  the master, so rotate sensitive secrets after revoking a device. Master rotation + re-wrap is deferred.
+- **Vault grant revocation is single-store.** `verify_grant` treats a deleted `g.<id>` record as revoked;
+  there is no on-chain vault-grant revocation list. Use short grant expiries.
+- **The P-256 ↔ NodeId bridge binds at enroll time.** A device with no registered NodeId can authenticate
+  (proof of possession) but cannot be minted a capability (no principal). The binding is asserted by the
+  enrolling admin, not independently proven; trust your admins.
 
 ## Reporting
 

@@ -4,6 +4,11 @@ IAM / identity-and-access-management as a managed product over CE's capability p
 (`ce-cap`). It gives you the familiar **AWS-IAM vocabulary** — principals, roles, policies,
 mint / attenuate / verify / revoke — implemented as **signed, attenuating capability chains**.
 
+It is the **merged** identity + access + secrets system: capabilities, device enrollment, and the
+secrets vault, in two crates over the CE primitives. The locked merge plan — what folded in from
+`ce-auth` / `ce-secrets` / `ce-secrets-rs`, the small-vs-big split, and the invariants — is
+[`docs/MERGE.md`](docs/MERGE.md).
+
 Nothing here is a new node feature. `ce-iam` is an SDK / app tier that composes existing CE:
 
 - **`ce-cap`** — the authorization primitive (signed attenuating chains, offline verification).
@@ -135,6 +140,22 @@ iam.verify(
 `RevocationSet::fetch(&ce_rs::CeClient)` reads the live on-chain revoked set for the `is_revoked`
 predicate. See `examples/delegate.rs` for a full mint → attenuate → verify → revoke walkthrough.
 
+The secrets vault is the other half of the SDK (`ce-iam-core::secrets`, no minting needed):
+
+```rust
+use ce_iam_core::secrets::{Vault, MemStore, DeviceKey};
+
+let owner = Vault::new(MemStore::new(), DeviceKey::generate()?, "my-vault");
+owner.init("laptop").await?;                                  // establish from the owner key
+owner.put_secret("db-url", b"postgres://...", "opaque").await?;
+let revealed = owner.get_secret("db-url").await?;             // master-sealed; bytes for use only
+// A second device enrolls via owner-approved pairing, then reads the same secret:
+let code = phone.request_pairing("phone").await?;            // on the new device
+owner.approve_pairing(&code).await?;                          // on an enrolled device
+// And after a total store wipe, the owner recovers from its key ALONE (deterministic master):
+owner.recover("laptop").await?;
+```
+
 ## CLI
 
 ```
@@ -177,7 +198,32 @@ ce-iam root    list                                 # configured roots + accepte
 ce-iam root    retire <key> [--in-secs <s>]         # overlap-safe retirement (sets not_after)
 ce-iam root    rm <key>                             # hard-remove
 ce-iam root    reissue <token> --nonce 2            # migrate a root grant under this node's key
+
+# --- devices (the operator registry + P-256<->NodeId bridge, from ce-iam-core) ---
+ce-iam device  claim <device-id> --pub <b64> [--node-id <hex>]   # TOFU: become the admin if none exists
+ce-iam device  request <device-id> --pub <b64> [--node-id <hex>] [--label phone]  # ask to enroll (pending)
+ce-iam device  list [--json]                        # enrolled/pending devices + bound node ids
+ce-iam device  approve <device-id>                  # promote a pending device to admin
+ce-iam device  revoke  <device-id>                  # remove a device (the last admin is protected)
+
+# --- secrets (the vault over the mesh ce-kv store, from ce-iam-core::secrets) ---
+ce-iam secret  init    [--ns <ns>] [--label ...]    # establish the vault on this owner device (idempotent)
+ce-iam secret  recover [--ns <ns>]                  # re-derive the master from THIS owner key alone
+ce-iam secret  gen     <name> --type token [--length 32]   # generate + store a secret (never printed)
+ce-iam secret  put     <name> [--type opaque]       # store a value from stdin (never echoed)
+ce-iam secret  get     <name> [--force]             # reveal a value for piping/injection (refuses a TTY)
+ce-iam secret  rotate  <name>                        # new value, bumped version
+ce-iam secret  list    [--json]                      # names + type + version + fingerprint (never values)
+ce-iam secret  rm      <name>
+ce-iam secret  grant   <audience> --read <name>... [--expires <iso>]   # signed read-grant for an app
+ce-iam secret  use     <name>=ENV ... -- <cmd> ...   # run a command with secrets injected as env vars
 ```
+
+`device *` manages the persisted operator registry (`devices.json`) and the binding from a device's
+P-256 ce-secrets key to its CE NodeId (the principal a minted capability targets). `secret *` drives
+`ce-iam-core::secrets::Vault` over the durable mesh ce-kv store (`--kv-node` selects the node, `--ns`
+the vault namespace, default this device id). Secret values are **never** displayed by `list`/`gen`/
+`put`; only `get`/`use` reveal them, for piping into a process.
 
 `grant`, `verify`, `policy *`, `role *`, `wallet *`, `root add|list|retire|rm|reissue`, and `whoami`
 are fully offline. `verify` exits non-zero on DENY so scripts can branch on authorization. `verify`
@@ -199,6 +245,24 @@ configured via `root add` (filtered to those inside their validity window at the
 All conditions are enforced by `ce-cap` at verify time and are checked to *narrow only* during
 attenuation (a child can never raise a ceiling, widen the port set, escape the path prefix, or
 outlive its parent).
+
+## SDKs (Rust, TypeScript, wasm)
+
+The same system is reachable from three runtimes, all backed by the one Rust core so crypto agrees
+byte-for-byte:
+
+- **Rust** — depend on the crate directly. Most apps want **`ce-iam-core`** (verify caps + hold/recover
+  secrets + enroll devices, minimal deps); apps that *issue* authority want the full **`ce-iam`**. The
+  library examples above and `ce-iam-core::secrets::Vault` are the Rust SDK.
+- **wasm** — **`ce-iam-core-wasm`** (sibling repo) is a `wasm-bindgen` port of the **small** crate:
+  `WasmVault` (init/recover/get/put/list + pairing + issue/verify grant + challenge-response auth) and
+  `verify` (capability `authorize`). It is wasm-clean (getrandom/js + an injected clock; no tokio /
+  reqwest / ce-rs), builds for `wasm32-unknown-unknown`, and is what browsers and ce-cast load.
+- **TypeScript** — **`ce-iam-ts`** (`@ce-net/iam`, sibling repo) is a thin TS SDK over the wasm-pack
+  output: `openVault() / recover() / get() / put() / grant() / verify()` + pairing/auth, over a
+  pluggable `{get,put,del,list}` store. These are the exact verbs ce-cast's vendored `vault.mjs` used,
+  so ce-cast swaps its `src/vault/*` for a single `import { openVault } from "@ce-net/iam"`. The
+  canonical JS reference (`ce-secrets/src/crypto.mjs`) remains the golden-vector oracle for all three.
 
 ## Catalog, wallet, and roots (the managed product)
 
@@ -266,7 +330,8 @@ The suite is the foundation's validation and is meant to be read as the spec:
   `saturating_add`, so a huge CLI value can never wrap to a tiny/garbage timestamp.
 - Edition 2024.
 
-See `SECURITY.md` for the verifier trust model and how to operate revocation freshness, and
+See [`docs/MERGE.md`](docs/MERGE.md) for the merge plan and locked invariants, `SECURITY.md` for the
+full trust model (capabilities + devices + the secrets vault) and the Phase-5 security checklist, and
 `CHANGELOG.md` for the change history.
 
 ## License

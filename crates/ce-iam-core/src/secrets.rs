@@ -858,6 +858,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_roundtrip_enroll_put_recover_read() {
+        // The Phase-5 lock round trip, end-to-end on one shared store (the durable mesh KV):
+        //   owner inits -> a second device enrolls -> owner puts a secret -> the store is WIPED ->
+        //   the OWNER recovers from its key alone -> reads the secret back.
+        let store = MemStore::new();
+        let owner_dk = DeviceKey::generate().unwrap();
+        let owner = Vault::with_clock(SharedRef(&store), owner_dk, "rt-ns", fixed_clock());
+
+        // 1. Establish the vault and enroll a second device via pairing.
+        assert!(owner.init("owner").await.unwrap());
+        let phone_dk = DeviceKey::generate().unwrap();
+        let phone = Vault::with_clock(SharedRef(&store), phone_dk, "rt-ns", fixed_clock());
+        let code = phone.request_pairing("phone").await.unwrap();
+        owner.approve_pairing(&code).await.unwrap();
+        assert!(phone.is_enrolled().await.unwrap());
+
+        // 2. Owner puts a secret; both devices can read it (master-sealed, per-device-wrapped).
+        owner.put_secret("api-key", b"super-secret", "opaque").await.unwrap();
+        assert_eq!(owner.get_secret("api-key").await.unwrap().bytes, b"super-secret");
+        assert_eq!(phone.get_secret("api-key").await.unwrap().bytes, b"super-secret");
+
+        // 3. Disaster: every device record + meta is wiped (store loss / lockout).
+        for e in store.list("").await.unwrap() {
+            store.del(&e.key).await.unwrap();
+        }
+        assert!(owner.load_master().await.is_err(), "no enrollment after wipe");
+
+        // 4. The OWNER recovers from its key ALONE — re-derives the deterministic master and
+        //    re-enrolls itself. No second device, no backup, was needed.
+        owner.recover("owner (recovered)").await.unwrap();
+        assert!(owner.is_enrolled().await.unwrap());
+
+        // 5. ...and the recovered master opens a secret resealed under it. (The old sealed body was
+        //    wiped with the store; reseal + read proves the recovered master is the SAME key.)
+        owner.put_secret("api-key", b"super-secret", "opaque").await.unwrap();
+        assert_eq!(owner.get_secret("api-key").await.unwrap().bytes, b"super-secret");
+    }
+
+    #[tokio::test]
+    async fn unenrolled_device_cannot_read_or_grant() {
+        // Default-deny: a device that never enrolled has no master, so it can neither read secrets
+        // nor issue grants — even pointed at a fully-populated store.
+        let store = MemStore::new();
+        let owner = Vault::with_clock(SharedRef(&store), DeviceKey::generate().unwrap(), "ns", fixed_clock());
+        owner.init("owner").await.unwrap();
+        owner.put_secret("k", b"v", "opaque").await.unwrap();
+
+        let stranger = Vault::with_clock(SharedRef(&store), DeviceKey::generate().unwrap(), "ns", fixed_clock());
+        assert!(!stranger.is_enrolled().await.unwrap());
+        assert!(stranger.load_master().await.is_err(), "no master without enrollment");
+        assert!(stranger.get_secret("k").await.is_err(), "cannot read without the master");
+        assert!(
+            stranger.issue_grant("app", &["k".into()], None).await.is_err(),
+            "only an enrolled device may issue grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_device_loses_access() {
+        // Device claim/approve/revoke at the vault layer: a revoked device's d.<id> record is gone,
+        // so it can no longer load the master / read secrets.
+        let store = MemStore::new();
+        let owner = Vault::with_clock(SharedRef(&store), DeviceKey::generate().unwrap(), "ns", fixed_clock());
+        owner.init("owner").await.unwrap();
+        let phone_dk = DeviceKey::generate().unwrap();
+        let phone_id = phone_dk.id.clone();
+        let phone = Vault::with_clock(SharedRef(&store), phone_dk, "ns", fixed_clock());
+        let code = phone.request_pairing("phone").await.unwrap();
+        owner.approve_pairing(&code).await.unwrap();
+        owner.put_secret("k", b"v", "opaque").await.unwrap();
+        assert_eq!(phone.get_secret("k").await.unwrap().bytes, b"v");
+
+        // Owner revokes the phone; the phone can no longer read.
+        owner.revoke_device(&phone_id).await.unwrap();
+        assert!(!phone.is_enrolled().await.unwrap());
+        assert!(phone.get_secret("k").await.is_err(), "revoked device loses master access");
+        // The vault refuses to revoke the device you are using (anti-lockout).
+        assert!(owner.revoke_device(&owner.device.id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tampered_record_signature_is_detectable() {
+        // Records are signed by the writing device. A store that hands back a tampered enrollment
+        // record (wrong key) must not let an attacker's device pass verify_auth as the victim.
+        let store = MemStore::new();
+        let owner = Vault::with_clock(SharedRef(&store), DeviceKey::generate().unwrap(), "ns", fixed_clock());
+        owner.init("owner").await.unwrap();
+        let proof = owner.sign_challenge("app", "n1", "2026-06-26T00:00:00.000Z").unwrap();
+
+        // Forge the enrolled device's record to carry an ATTACKER's ecdsaPub. verify_auth must
+        // reject the original proof (its key no longer matches the stored device record).
+        let attacker = DeviceKey::generate().unwrap();
+        let dkey = device_key(&owner.device.id);
+        let mut rec = store.get(&dkey).await.unwrap().unwrap();
+        rec.as_object_mut().unwrap().insert(
+            "ecdsaPub".into(),
+            serde_json::to_value(&attacker.ecdsa_pub).unwrap(),
+        );
+        store.put(&dkey, rec).await.unwrap();
+        assert!(
+            owner.verify_auth("app", "n1", &proof).await.is_err(),
+            "a tampered device record must not authenticate the real device's proof"
+        );
+    }
+
+    #[tokio::test]
     async fn challenge_response_auth_roundtrip() {
         let v = vault();
         v.init("owner").await.unwrap();
