@@ -91,4 +91,17 @@ An app that only verifies caps + holds secrets depends on the small crate and ne
     record, fingerprint, DeviceKey::generate) — golden-vectored against the JS in
     `crates/ce-iam-core/tests/golden_secrets.rs` (fixtures from `fixtures/gen_secrets_vectors.mjs`).
   - Tests: 160 existing ce-iam tests + ce-iam-core unit + 9 golden-vector tests all green on the relay.
-- **Phases 3–5 (pending):** unified CLI verbs for device/secret, wasm + TS ports, lock + retire.
+- **Phase 4 ports (done):** the SMALL crate now has wasm + TS ports (new sibling repos, no CLI
+  collision):
+  - `ce-iam-core-wasm` — wasm-bindgen over `ce-iam-core`: `WasmVault` (init/recover/get/put/list +
+    pairing + issue/verify grant + challenge-response auth) + `verify` (cap `authorize`). Wasm-clean
+    (getrandom/js + injected clock; no tokio/reqwest/ce-rs); `src/core.rs` holds the host-testable
+    logic, `src/lib.rs` the thin `#[wasm_bindgen]` wrappers. `wasm32-unknown-unknown` builds; 7 host
+    tests (2 unit + 5 golden) green on the relay; same `secrets_vectors.json` fixtures as Phase 2.
+  - `ce-iam-ts` (`@ce-net/iam`) — thin TS SDK over the wasm-pack output (vendored in `src/wasm`):
+    `openVault()/recover()/get()/put()/grant()/verify()` + pairing/auth, over a pluggable
+    `{get,put,del,list}` store (the snapshot bridge syncs the wasm in-memory store to the durable mesh
+    KV). Same verbs ce-cast's `vault.mjs`/`delivery.ts` use, so ce-cast swaps its vendored vault for
+    this. `npm run build` + `npm test` green (6 tests incl. golden parity SDK->wasm->ce-iam-core).
+- **Phases 3, 5 (pending):** unified CLI verbs for device/secret; lock + retire ce-auth/ce-secrets-rs;
+  ce-cast's `src/vault/*` actually swapped to import `@ce-net/iam`.
