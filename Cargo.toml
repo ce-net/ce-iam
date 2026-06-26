@@ -16,7 +16,7 @@ members = ["crates/ce-iam-core", "crates/ce-iam"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
 repository = "https://github.com/ce-net/ce-iam"
 
