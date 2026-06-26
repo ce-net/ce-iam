@@ -23,9 +23,12 @@
 pub mod attestation;
 pub mod device;
 pub mod secrets;
+pub mod trust;
 
 // Real-world identity attestations (BankID/Google/OIDC bind a node to a verified human).
 pub use attestation::{max_level, Attestation, AttestationBody, Claim};
+// Trust model: federated provider weights -> a node's trust score (Phases 5-6; gates the economy).
+pub use trust::{Provider, ProviderWeight, TrustPolicy};
 
 // Device enrollment (folded in from the former ce-auth crate's store.rs).
 pub use device::{Device, DeviceStore, ROLE_ADMIN, ROLE_PENDING, RevokeOutcome};
