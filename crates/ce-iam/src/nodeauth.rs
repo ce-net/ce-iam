@@ -41,6 +41,11 @@ use crate::{Conditions, Iam, Principal, ResourceMatch, simple_policy};
 
 /// The well-known topic CE nodes announce themselves on for browser discovery.
 pub const T_ANNOUNCE: &str = "ce-iam/nodes/announce";
+/// The DIRECTED request/reply topic for the vouch. A browser sends a `/mesh/request` to the node id on
+/// this topic; the node replies with the cap. Directed RPC is reliable (point-to-point libp2p with NAT
+/// traversal) — unlike the gossip req/resp topics, which are best-effort broadcast and can drop a
+/// one-shot handshake between two remote nodes. Discovery still rides the gossip announce above.
+pub const T_DIRECT: &str = "ce-iam/auth";
 /// The ability asserting "a node vouches this is a real account".
 pub const ABILITY_LOGIN: &str = "account:login";
 
@@ -225,8 +230,39 @@ impl NodeAuthResponder {
         Ok(())
     }
 
-    /// Run the responder until `shutdown` resolves: announce every 10s, and answer vouch requests on
-    /// `ce-iam/auth/req/<myNodeId>`. Reconnects to the message stream with capped backoff.
+    /// Handle one DIRECTED vouch request (a `/mesh/request` on `T_DIRECT`, carrying a `reply_token`):
+    /// mint the cap and reply on the same RPC. This is the reliable path — point-to-point libp2p.
+    async fn handle_direct(&self, token: u64, payload: &[u8]) -> Result<()> {
+        let req: AuthReq = serde_json::from_slice(payload).context("decode direct auth request")?;
+        let name = if req.name.is_empty() { "pilot".to_string() } else { req.name.clone() };
+        if !self.auto_approve {
+            warn!(peer = %req.peer_id, %name, "direct vouch request but auto-approve is OFF — ignoring");
+            return Ok(());
+        }
+        let granted = self.grantable(&req.abilities);
+        if granted.len() != req.abilities.len() {
+            let denied: Vec<&String> = req.abilities.iter().filter(|a| !granted.contains(a)).collect();
+            warn!(peer = %req.peer_id, ?denied, "node-auth: denied abilities not in allow-list");
+        }
+        let (cap, abilities) = self.vouch_token(&req.peer_id, &name, &granted)?;
+        let resp = json!({
+            "nonce": req.nonce,
+            "cap": cap,
+            "nodeId": self.node_id_hex,
+            "name": name,
+            "abilities": abilities,
+        });
+        self.client
+            .reply(token, &serde_json::to_vec(&resp)?)
+            .await
+            .context("reply to direct auth request")?;
+        info!(peer = %req.peer_id, %name, ?granted, "vouched via directed RPC");
+        Ok(())
+    }
+
+    /// Run the responder until `shutdown` resolves: announce periodically for discovery, and answer
+    /// vouch requests — both the reliable DIRECTED `/mesh/request` path (`T_DIRECT`) and the legacy
+    /// gossip `ce-iam/auth/req/<myNodeId>` path. Reconnects to the message stream with capped backoff.
     pub async fn run(&self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         use futures_util::StreamExt as _;
 
@@ -236,7 +272,9 @@ impl NodeAuthResponder {
         info!(node = %self.node_id_hex, label = %self.label, "node-auth responder running");
 
         tokio::pin!(shutdown);
-        let mut announce = tokio::time::interval(Duration::from_secs(10));
+        // Announce often so a freshly-loaded app discovers this node within a couple of seconds
+        // (the browser's `authorizeApp` listens only briefly before requesting a vouch).
+        let mut announce = tokio::time::interval(Duration::from_secs(3));
         announce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut backoff_ms = 250u64;
 
@@ -262,6 +300,19 @@ impl NodeAuthResponder {
                         let _ = self.client.publish(T_ANNOUNCE, &self.announce_payload()).await;
                     }
                     item = stream.next() => match item {
+                        // Reliable directed path: a `/mesh/request` on T_DIRECT carries a reply_token.
+                        Some(Ok(m)) if m.reply_token.is_some() && m.topic == T_DIRECT => {
+                            let token = m.reply_token.expect("checked is_some");
+                            match m.payload() {
+                                Ok(p) => {
+                                    if let Err(e) = self.handle_direct(token, &p).await {
+                                        warn!(error = %e, "node-auth: direct vouch failed");
+                                    }
+                                }
+                                Err(e) => warn!(error = %e, "node-auth: undecodable direct payload"),
+                            }
+                        }
+                        // Legacy gossip path (best-effort; kept for older clients).
                         Some(Ok(m)) if m.topic == req_topic => {
                             match m.payload() {
                                 Ok(p) => {
@@ -292,6 +343,7 @@ mod tests {
     #[test]
     fn topics_match_account_js() {
         assert_eq!(T_ANNOUNCE, "ce-iam/nodes/announce");
+        assert_eq!(T_DIRECT, "ce-iam/auth");
         assert_eq!(t_req("NODE"), "ce-iam/auth/req/NODE");
         assert_eq!(t_resp("PEER"), "ce-iam/auth/resp/PEER");
         assert_eq!(ability_peer("12D3Koo"), "account:peer:12D3Koo");
