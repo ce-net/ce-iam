@@ -36,7 +36,13 @@ pub use device::{Device, DeviceStore, ROLE_ADMIN, ROLE_PENDING, RevokeOutcome};
 // The secrets vault: owner-derived, per-device-wrapped master + sealed secrets + grants + auth.
 pub use secrets::{DeviceKey, MemStore, Store, Vault};
 
-// Capability VERIFY + identity — re-exported so a consumer can depend on `ce-iam-core` alone to verify
-// a presented capability chain and name principals. (MINTING authority lives in the `ce-iam` crate.)
-pub use ce_cap::{Capability, Caveats, Resource, SignedCapability, authorize};
+// Capability VERIFY + the chain serialize/inspect helpers a verifier needs (decode a presented
+// token, hash a capability, re-encode a held chain). MINTING POLICY (Iam::mint / roles) lives in
+// `ce-iam`; the raw `SignedCapability::issue` is reachable via the re-exported type for low-level use.
+// This is the full surface apps previously imported from `ce-cap`, so they migrate by a mechanical
+// `ce_cap::` -> `ce_iam_core::` swap.
+pub use ce_cap::{
+    CapId, Capability, Caveats, Resource, SignedCapability, authorize, cap_bytes, cap_id,
+    decode_chain, decode_chain_bytes, encode_chain, encode_chain_bytes,
+};
 pub use ce_identity::{Identity, NodeId};
