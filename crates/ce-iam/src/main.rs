@@ -103,6 +103,11 @@ struct NodeAuthArgs {
     /// default every well-formed request from a browser is vouched.
     #[arg(long)]
     no_approve: bool,
+    /// App-ability prefix this node will grant on request, e.g. `cast:` (repeatable). A requested
+    /// ability is granted iff it starts with one of these; `account:` identity abilities are always
+    /// granted. Omit ⇒ grant any requested ability (open; logged). This is the per-app consent surface.
+    #[arg(long = "grant-prefix")]
+    grant_prefixes: Vec<String>,
 }
 
 #[derive(Args)]
@@ -759,8 +764,15 @@ async fn cmd_node_auth(cli: &Cli, a: &NodeAuthArgs) -> Result<()> {
     // The node is its own capability root; minting only signs, so no accepted roots are needed here.
     let iam = Iam::new();
     let label = if a.label.is_empty() { node_id[..8.min(node_id.len())].to_string() } else { a.label.clone() };
-    let responder =
-        NodeAuthResponder::new(client, identity, iam, label, a.owner.clone(), !a.no_approve);
+    let responder = NodeAuthResponder::with_allowed(
+        client,
+        identity,
+        iam,
+        label,
+        a.owner.clone(),
+        !a.no_approve,
+        a.grant_prefixes.clone(),
+    );
     eprintln!(
         "node-auth responder for node {node_id} — announcing on `ce-iam/nodes/announce`, vouching on \
          requests. Ctrl-C to stop."
