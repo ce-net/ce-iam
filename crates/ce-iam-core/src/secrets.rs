@@ -462,6 +462,17 @@ impl<S: Store> Vault<S> {
         })
     }
 
+    /// Turnkey getter: the decrypted bytes of a secret by name. This is the `vault.get("name")` in the
+    /// "any app, any device, same account — one line" story (`open_vault_default().await?.get(name)`).
+    pub async fn get(&self, name: &str) -> Result<Vec<u8>> {
+        Ok(self.get_secret(name).await?.bytes)
+    }
+
+    /// Turnkey setter mirroring [`get`](Self::get): store opaque bytes under `name`.
+    pub async fn set(&self, name: &str, bytes: &[u8]) -> Result<SecretMeta> {
+        self.put_secret(name, bytes, "opaque").await
+    }
+
     /// List secret metadata (never bytes), sorted by name.
     pub async fn list_secrets(&self) -> Result<Vec<SecretMeta>> {
         let mut out: Vec<SecretMeta> = self

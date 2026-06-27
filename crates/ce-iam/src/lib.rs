@@ -103,6 +103,59 @@ pub use wallet::{WalletEntry, WalletStore};
 pub use ce_cap::{Caveats, Resource, SignedCapability};
 pub use ce_identity::{Identity, NodeId};
 
+// ---- turnkey SDK -----------------------------------------------------------------------------------
+//
+// The one-dep, one-line "any app, any device, same account" entry point (gap #1 — highest leverage):
+//
+//     let key = ce_iam::open_vault_default().await?.get("crosspost-linkedin-default").await?;
+//
+// It wraps the hand-wiring an app used to do (persistent device key + `MeshKvStore::connect` + `Vault::new`)
+// with sane defaults: the device key persists under the default CE data dir — the SAME
+// `<iam>/secrets-device.json` the `ce-iam` CLI uses, so the CLI and the SDK are ONE identity — the store is
+// the local node's mesh KV, and the namespace is the owner identity (this device's id), i.e. your private
+// per-identity vault, reachable mesh-wide. `open_vault_default_ns` opens a shared/named vault instead.
+
+/// Open this operator's default mesh vault (namespace = the owner device id). See module note above.
+pub async fn open_vault_default() -> anyhow::Result<Vault<MeshKvStore>> {
+    let device = load_default_device_key()?;
+    let ns = device.id.clone();
+    Ok(open_vault_with(device, ns))
+}
+
+/// Open a named/shared mesh vault for this operator (e.g. an app or team namespace).
+pub async fn open_vault_default_ns(ns: impl Into<String>) -> anyhow::Result<Vault<MeshKvStore>> {
+    let device = load_default_device_key()?;
+    Ok(open_vault_with(device, ns.into()))
+}
+
+fn open_vault_with(device: DeviceKey, ns: String) -> Vault<MeshKvStore> {
+    let node = ce_rs::DEFAULT_BASE_URL.to_string();
+    let token = ce_rs::discover_api_token();
+    Vault::new(MeshKvStore::connect(&ns, node, token), device, ns)
+}
+
+/// Load (or first-time create, mode 0600) this operator's persistent vault device key at the default CE
+/// data dir's `<iam>/secrets-device.json` — identical to the `ce-iam` CLI, so they share one identity.
+fn load_default_device_key() -> anyhow::Result<DeviceKey> {
+    let dir = iam_dir(None).map_err(|e| anyhow::anyhow!("{e}"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("secrets-device.json");
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path)?;
+        if !raw.trim().is_empty() {
+            return DeviceKey::from_json(&raw).map_err(|e| anyhow::anyhow!("{e}"));
+        }
+    }
+    let dk = DeviceKey::generate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    std::fs::write(&path, dk.to_json()?.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(dk)
+}
+
 /// A conventional starting action universe for the CE Cloud suite — the abilities the published
 /// products (`ce-storage`, `ce-db`, `ce-run`/`ce-fn`, `ce-drive`, tunnel) understand. Apps are free
 /// to supply their own; abilities are opaque strings owned by each consuming product.
