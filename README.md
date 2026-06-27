@@ -156,6 +156,20 @@ owner.approve_pairing(&code).await?;                          // on an enrolled 
 owner.recover("laptop").await?;
 ```
 
+For the common case, skip the wiring with the turnkey helpers in `ce_iam`:
+`open_vault_default()`, `open_vault_default_ns(ns)`, and `open_vault_ns_authed(...)` open a vault
+backed by the durable mesh ce-kv store in one line.
+
+Two more public modules round out the SDK:
+
+- **`ce_iam::authkv`** — `AuthKv` / `AuthKvMap`, the authenticated mesh KV the vault runs over
+  (abilities `ABILITY_KV_READ` / `ABILITY_KV_WRITE`, plus `kv_service` / `kv_topic` and
+  `MeshKvStore`).
+- **`ce_iam::nodeauth`** — `NodeAuthResponder` (the passwordless "log in with your local node"
+  responder behind `ce-iam node-auth`), `ABILITY_LOGIN`, `T_ANNOUNCE`. The cap-bridge helpers
+  (`CapBridge`, `ABILITY_OPERATOR`, `ability_for_aud`) and the `CE_CLOUD_ACTIONS` /
+  `ce_cloud_action_universe()` action catalog are also exported.
+
 ## CLI
 
 ```
@@ -208,7 +222,7 @@ ce-iam device  revoke  <device-id>                  # remove a device (the last 
 
 # --- secrets (the vault over the mesh ce-kv store, from ce-iam-core::secrets) ---
 ce-iam secret  init    [--ns <ns>] [--label ...]    # establish the vault on this owner device (idempotent)
-ce-iam secret  recover [--ns <ns>]                  # re-derive the master from THIS owner key alone
+ce-iam secret  recover [--ns <ns>] [--label ...]    # re-derive the master from THIS owner key alone
 ce-iam secret  gen     <name> --type token [--length 32]   # generate + store a secret (never printed)
 ce-iam secret  put     <name> [--type opaque]       # store a value from stdin (never echoed)
 ce-iam secret  get     <name> [--force]             # reveal a value for piping/injection (refuses a TTY)
@@ -217,6 +231,11 @@ ce-iam secret  list    [--json]                      # names + type + version + 
 ce-iam secret  rm      <name>
 ce-iam secret  grant   <audience> --read <name>... [--expires <iso>]   # signed read-grant for an app
 ce-iam secret  use     <name>=ENV ... -- <cmd> ...   # run a command with secrets injected as env vars
+ce-iam secret  enrol-issue   ...                     # issue a one-time enrollment voucher (hands-free device add)
+ce-iam secret  enrol-redeem  ...                     # redeem a voucher on a new/unattended device
+
+# --- passwordless node-auth ("your local node is your login") ---
+ce-iam node-auth                    # run the responder so a browser/app can authenticate via this node
 ```
 
 `device *` manages the persisted operator registry (`devices.json`) and the binding from a device's
@@ -336,4 +355,5 @@ full trust model (capabilities + devices + the secrets vault) and the Phase-5 se
 
 ## License
 
-MIT.
+AGPL-3.0-only. A commercial license is also available — see [`LICENSING.md`](./LICENSING.md)
+and [`COMMERCIAL-LICENSE.md`](./COMMERCIAL-LICENSE.md).
