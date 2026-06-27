@@ -63,11 +63,14 @@
 //! # Ok(()) }
 //! ```
 
+pub mod audit;
+pub mod authkv;
 pub mod bridge;
 pub mod catalog;
 pub mod error;
 pub mod grant;
 pub mod kv_store;
+pub mod nodeauth;
 pub mod policy;
 pub mod principal;
 pub mod revocation;
@@ -91,7 +94,13 @@ pub use bridge::{ABILITY_OPERATOR, CapBridge, ability_for_aud};
 pub use catalog::{AuditEntry, Catalog, CatalogLog, CatalogOp, EffectiveGrant};
 pub use error::IamError;
 pub use grant::{Grant, Iam, LinkInfo, Scope, render_resource, simple_policy};
+pub use audit::{Action as AuditAction, Audit, Event as AuditEvent};
+pub use authkv::{
+    ABILITY_KV_READ, ABILITY_KV_WRITE, AuthKv, AuthKvMap, KvOp, is_sensitive_key, kv_collection,
+    kv_service, kv_topic,
+};
 pub use kv_store::MeshKvStore;
+pub use nodeauth::{ABILITY_LOGIN, NodeAuthResponder, T_ANNOUNCE, ability_name, ability_peer};
 pub use policy::{Conditions, Effect, Policy, ResourceMatch, Role, Statement};
 pub use principal::Principal;
 pub use revocation::{CachedRevocationSet, RevocationPolicy, RevocationSet};
@@ -126,6 +135,23 @@ pub async fn open_vault_default() -> anyhow::Result<Vault<MeshKvStore>> {
 pub async fn open_vault_default_ns(ns: impl Into<String>) -> anyhow::Result<Vault<MeshKvStore>> {
     let device = load_default_device_key()?;
     Ok(open_vault_with(device, ns.into()))
+}
+
+/// Open a named/shared mesh vault hosted by a REMOTE [`authkv::AuthKv`] that enforces capability
+/// access, presenting `caps` (a hex `kv:read`+`kv:write` grant the namespace owner issued you) on
+/// every op. Use this for a vault you do not host yourself — a teammate's or an app's namespace whose
+/// `AuthKv` runs `enforcing(true, true)`. For your OWN per-identity vault use [`open_vault_default`]
+/// (the writer node trusts its self-delivered ops, so no cap is needed).
+pub async fn open_vault_ns_authed(
+    ns: impl Into<String>,
+    caps: impl Into<String>,
+) -> anyhow::Result<Vault<MeshKvStore>> {
+    let device = load_default_device_key()?;
+    let ns = ns.into();
+    let node = ce_rs::DEFAULT_BASE_URL.to_string();
+    let token = ce_rs::discover_api_token();
+    let store = MeshKvStore::connect(&ns, node, token).with_caps(caps);
+    Ok(Vault::new(store, device, ns))
 }
 
 fn open_vault_with(device: DeviceKey, ns: String) -> Vault<MeshKvStore> {

@@ -146,6 +146,10 @@ pub struct Vault<S: Store> {
     device: DeviceKey,
     ns: String,
     now_iso: Box<dyn Fn() -> String + Send + Sync>,
+    /// Numeric unix-seconds clock, used for the enrol-token expiry math (a numeric `expires`/`ts` that
+    /// the redeem path compares with `<`). Separate from `now_iso` because record timestamps are ISO
+    /// strings while expiries must be ordered integers. Defaults to the wall clock.
+    now_unix: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl<S: Store> Vault<S> {
@@ -157,6 +161,7 @@ impl<S: Store> Vault<S> {
             device,
             ns: ns.into(),
             now_iso: Box::new(now_iso_utc),
+            now_unix: Box::new(now_unix_secs),
         }
     }
 
@@ -173,6 +178,7 @@ impl<S: Store> Vault<S> {
             device,
             ns: ns.into(),
             now_iso: Box::new(clock),
+            now_unix: Box::new(now_unix_secs),
         }
     }
 
@@ -188,6 +194,11 @@ impl<S: Store> Vault<S> {
 
     fn now(&self) -> String {
         (self.now_iso)()
+    }
+
+    /// Numeric unix-seconds now, for ordered expiry math (enrol tokens).
+    fn now_secs(&self) -> i64 {
+        (self.now_unix)()
     }
 
     // ---- master key --------------------------------------------------------------------------
@@ -313,6 +324,64 @@ impl<S: Store> Vault<S> {
         self.enroll(&pubv, &master, &label, &id).await?;
         self.store.del(&pair_key(code)).await?;
         Ok(id)
+    }
+
+    /// Issue a ONE-TIME enrolment token so a fresh device — an unattended VM, a CI runner — can self-join
+    /// this account WITHOUT a human running `approve` (gap #2: capability-delegated bootstrap for hands-free
+    /// distributed E2E). The owner master is SEALED under a fresh random secret and stored at `enrol.<id>`;
+    /// the returned token carries `<id>.<secret>` (the secret never reaches the store in the clear). A
+    /// holder calls [`redeem_enrol_token`](Self::redeem_enrol_token) ONCE: it recovers the master, enrolls
+    /// its own device key, and burns the token. `ttl_secs` bounds validity. Hand the token to the VM out of
+    /// band (cloud-init, a sealed env var, a CE capability drop).
+    pub async fn issue_enrol_token(&self, label: &str, ttl_secs: u64) -> Result<String> {
+        let master = self.load_master().await?;
+        let mut secret = [0u8; 32];
+        fill_random(&mut secret);
+        let sealed = seal_secret(&secret, &master).context("seal master under the enrol token")?;
+        let id = fingerprint(&secret); // a non-secret slot id derived from the secret
+        self.store
+            .put(
+                &enrol_key(&id),
+                json!({
+                    "id": id,
+                    "label": if label.is_empty() { "enrolled device" } else { label },
+                    "sealed": serde_json::to_value(&sealed).context("encode sealed master")?,
+                    "expires": self.now_secs() + ttl_secs as i64,
+                    "ts": self.now_secs(),
+                }),
+            )
+            .await?;
+        Ok(format!("{id}.{}", b64_encode(&secret)))
+    }
+
+    /// Redeem a one-time enrolment token on a FRESH device: recover the account master and enroll THIS
+    /// device, then burn the token (so it cannot be replayed). Afterwards `open_vault_default()` on this
+    /// device reads the SAME account mesh-wide — the hands-free "fresh VM, same account" path.
+    pub async fn redeem_enrol_token(&self, token: &str, label: &str) -> Result<()> {
+        let (id, secret_b64) = token
+            .split_once('.')
+            .ok_or_else(|| anyhow!("malformed enrol token (want <id>.<secret>)"))?;
+        let secret = b64_decode(secret_b64).context("decode enrol token secret")?;
+        let rec = self
+            .store
+            .get(&enrol_key(id))
+            .await?
+            .ok_or_else(|| anyhow!("enrol token not found (already used, or never issued)"))?;
+        if rec.get("expires").and_then(|v| v.as_i64()).unwrap_or(0) < self.now_secs() {
+            bail!("enrol token expired");
+        }
+        let sealed: SealedSecret = serde_json::from_value(
+            rec.get("sealed")
+                .cloned()
+                .ok_or_else(|| anyhow!("enrol token has no sealed master"))?,
+        )
+        .context("parse sealed master")?;
+        let master = decrypt_secret(&secret, &sealed).context("recover master from enrol token")?;
+        let pubv = self.device.public_value();
+        let lbl = if label.is_empty() { "vm device" } else { label };
+        self.enroll(&pubv, &master, lbl, &self.device.id).await?;
+        self.store.del(&enrol_key(id)).await?; // one-time: burn it
+        Ok(())
     }
 
     /// List enrolled devices (id/label/addedAt + whether it is this device).
@@ -724,6 +793,31 @@ fn device_key(id: &str) -> String {
 fn pair_key(code: &str) -> String {
     format!("p.{code}")
 }
+/// One-time enrolment-token records (gap #2). Bootstrap class like `p.*`: a fresh, not-yet-enrolled device
+/// must be able to read + burn it, and the body is sealed under the token secret so an open read is safe.
+fn enrol_key(id: &str) -> String {
+    format!("enrol.{id}")
+}
+fn fill_random(buf: &mut [u8]) {
+    ce_secrets_rs::fill_random(buf);
+}
+/// Hex (dep-free) — the enrol token's secret is carried as `<id>.<hex>`.
+fn b64_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+fn b64_decode(s: &str) -> Result<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        bail!("odd-length hex secret");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
+}
 fn grant_key(id: &str) -> String {
     format!("g.{id}")
 }
@@ -755,6 +849,12 @@ fn pairing_code() -> String {
 fn now_iso_utc() -> String {
     let ms = ce_secrets_rs::now_unix_ms().max(0) as u64;
     iso_from_unix_ms(ms)
+}
+
+/// Current time as unix SECONDS, for ordered expiry math (enrol-token validity). Shares the one wall
+/// clock (`ce_secrets_rs::now_unix_ms`) the ISO timestamps use.
+fn now_unix_secs() -> i64 {
+    ce_secrets_rs::now_unix_ms() / 1000
 }
 
 /// Format unix-milliseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (the inverse of `parse_iso_ms`).

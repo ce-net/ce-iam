@@ -24,7 +24,10 @@ ce-iam-core = { path = "../ce-iam-core" }
 # CE substrate (by path, per task).
 ce-cap = { workspace = true }
 ce-identity = { workspace = true }
-ce-rs = { workspace = true }
+# `serve` for the AuthKv mesh serve loop (ce_rs::serve::{Handler, serve}).
+ce-rs = { workspace = true, features = ["serve"] }
+# Coordination tier — the replicated map backing the authenticated mesh KV (`authkv`).
+ce-coord = { workspace = true }
 # Byte-exact vault crypto primitives — used by the CLI's `secret gen` to mint secret material
 # (token/password/base64/uuid/aes-256/hex) the same way `ce-secrets/src/crypto.mjs` does.
 ce-secrets-rs = { workspace = true }
@@ -38,6 +41,9 @@ directories = { workspace = true }
 # CLI + async runtime (binary only, but cheap to depend on).
 clap = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+# Stream combinators for the node-auth responder's message loop.
+futures-util = { workspace = true }
 # Raw HTTP for the one endpoint ce-rs does not wrap (POST /capabilities/revoke).
 reqwest = { workspace = true }
 

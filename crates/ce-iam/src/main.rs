@@ -80,6 +80,29 @@ enum Command {
     /// value is NEVER printed.
     #[command(subcommand)]
     Secret(SecretCmd),
+    /// Run the passwordless browser<->node auth responder: announce this node, and vouch (mint a
+    /// node-signed capability) for browsers that ask, so "your local node is your login".
+    NodeAuth(NodeAuthArgs),
+}
+
+#[derive(Args)]
+struct NodeAuthArgs {
+    /// Local CE node HTTP API base URL.
+    #[arg(long, default_value = ce_rs::DEFAULT_BASE_URL)]
+    api: String,
+    /// CE node API token (else discovered from $CE_API_TOKEN / the data dir).
+    #[arg(long)]
+    token: Option<String>,
+    /// A human label announced for this node (defaults to the node id's first 8 hex chars).
+    #[arg(long, default_value = "")]
+    label: String,
+    /// An optional owner tag announced alongside the node (e.g. your handle).
+    #[arg(long)]
+    owner: Option<String>,
+    /// Do NOT auto-issue caps: log requests and wait (interactive approval is a follow-up). By
+    /// default every well-formed request from a browser is vouched.
+    #[arg(long)]
+    no_approve: bool,
 }
 
 #[derive(Args)]
@@ -494,6 +517,13 @@ enum SecretCmd {
     Grant(SecretGrantArgs),
     /// Run a command with named secrets injected as environment variables.
     Use(SecretUseArgs),
+    /// Issue a ONE-TIME enrolment token so a fresh, unattended device (a VM, a CI runner) can self-join
+    /// this account hands-free — no human running `approve`. Hand the printed token to the device out of
+    /// band (cloud-init, a sealed env var). Run on an ENROLLED device.
+    EnrolIssue(SecretEnrolIssueArgs),
+    /// Redeem a one-time enrolment token on THIS fresh device: recover the account master, enroll this
+    /// device, and burn the token. Afterwards the vault reads the SAME account mesh-wide.
+    EnrolRedeem(SecretEnrolRedeemArgs),
 }
 
 /// Shared flags selecting the vault: namespace + which CE node to reach the mesh ce-kv through.
@@ -583,6 +613,29 @@ struct SecretGrantArgs {
     /// Optional ISO-8601 expiry timestamp (e.g. 2026-12-31T00:00:00.000Z).
     #[arg(long)]
     expires: Option<String>,
+}
+
+#[derive(Args)]
+struct SecretEnrolIssueArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// A label recorded for the device that will redeem this token.
+    #[arg(long, default_value = "")]
+    label: String,
+    /// Validity window in seconds (default 1 hour). The token cannot be redeemed after it elapses.
+    #[arg(long, default_value_t = 3600)]
+    ttl: u64,
+}
+
+#[derive(Args)]
+struct SecretEnrolRedeemArgs {
+    #[command(flatten)]
+    vault: VaultArgs,
+    /// The one-time token printed by `secret enrol-issue` (format `<id>.<secret>`). Reads stdin if `-`.
+    token: String,
+    /// A label for THIS device in the vault.
+    #[arg(long, default_value = "")]
+    label: String,
 }
 
 #[derive(Args)]
@@ -692,7 +745,31 @@ async fn main() -> Result<()> {
         Command::Root(r) => cmd_root(&cli, r),
         Command::Device(d) => cmd_device(&cli, d),
         Command::Secret(s) => cmd_secret(&cli, s).await,
+        Command::NodeAuth(a) => cmd_node_auth(&cli, a).await,
     }
+}
+
+/// Run the passwordless browser<->node auth responder until Ctrl-C.
+async fn cmd_node_auth(cli: &Cli, a: &NodeAuthArgs) -> Result<()> {
+    use ce_iam::NodeAuthResponder;
+    let identity = load_identity(&cli.data_dir)?;
+    let node_id = identity.node_id_hex();
+    let client =
+        ce_rs::CeClient::with_token(&a.api, a.token.clone().or_else(ce_rs::discover_api_token));
+    // The node is its own capability root; minting only signs, so no accepted roots are needed here.
+    let iam = Iam::new();
+    let label = if a.label.is_empty() { node_id[..8.min(node_id.len())].to_string() } else { a.label.clone() };
+    let responder =
+        NodeAuthResponder::new(client, identity, iam, label, a.owner.clone(), !a.no_approve);
+    eprintln!(
+        "node-auth responder for node {node_id} — announcing on `ce-iam/nodes/announce`, vouching on \
+         requests. Ctrl-C to stop."
+    );
+    responder
+        .run(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
 }
 
 fn cmd_whoami(cli: &Cli, a: &WhoamiArgs) -> Result<()> {
@@ -1615,6 +1692,30 @@ async fn cmd_secret(cli: &Cli, s: &SecretCmd) -> Result<()> {
             }
             let status = cmd.status().with_context(|| format!("spawning {}", command[0]))?;
             std::process::exit(status.code().unwrap_or(0));
+        }
+        SecretCmd::EnrolIssue(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            require_enrolled(&vault).await?;
+            let token = vault.issue_enrol_token(&a.label, a.ttl).await?;
+            eprintln!(
+                "one-time enrol token (valid {}s) — hand it to the new device out of band, then run \
+                 `ce-iam secret enrol-redeem <token>` there:",
+                a.ttl
+            );
+            // The token itself is the only thing on stdout, so it pipes cleanly into cloud-init/secrets.
+            println!("{token}");
+            Ok(())
+        }
+        SecretCmd::EnrolRedeem(a) => {
+            let vault = open_vault(cli, &a.vault)?;
+            let token = if a.token == "-" {
+                read_secret_value()?
+            } else {
+                a.token.clone()
+            };
+            vault.redeem_enrol_token(&token, &a.label).await?;
+            println!("enrolled this device — the vault now reads the same account mesh-wide");
+            Ok(())
         }
     }
 }

@@ -41,6 +41,10 @@ pub struct MeshKvStore {
     service: String,
     /// The local node's API token (sent only to a plain-http local node, matching the JS).
     token: Option<String>,
+    /// Optional hex ce-cap chain attached to every op as `"caps"`, so this store can read/write a
+    /// REMOTE [`crate::authkv::AuthKv`] that enforces `kv:read`/`kv:write`. `None` for the local
+    /// owner-vault path, where the writer node trusts its own self-delivered ops.
+    caps: Option<String>,
     http: reqwest::Client,
 }
 
@@ -56,8 +60,18 @@ impl MeshKvStore {
             node_url,
             to_node: Mutex::new(std::env::var("CE_KV_NODE").ok().filter(|s| !s.trim().is_empty())),
             token,
+            caps: None,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Attach a hex ce-cap chain (a `kv:read`+`kv:write` grant) to every op, so this store can reach a
+    /// REMOTE [`crate::authkv::AuthKv`] that enforces capability access. The local owner-vault path does
+    /// not need this — the writer node trusts its own self-delivered ops.
+    pub fn with_caps(mut self, caps: impl Into<String>) -> Self {
+        let caps = caps.into();
+        self.caps = if caps.trim().is_empty() { None } else { Some(caps) };
+        self
     }
 
     /// The `Authorization` header value, sent only to a plain-`http://` local node (a public `…/ce`
@@ -103,8 +117,12 @@ impl MeshKvStore {
     }
 
     /// Issue one ce-kv request and return the decoded reply object.
-    async fn call(&self, request: Value) -> Result<Value> {
+    async fn call(&self, mut request: Value) -> Result<Value> {
         let to = self.resolve_node().await?;
+        // Attach our capability chain (if any) so a remote enforcing AuthKv can authorize the op.
+        if let (Some(caps), Some(obj)) = (&self.caps, request.as_object_mut()) {
+            obj.insert("caps".into(), Value::String(caps.clone()));
+        }
         let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("?").to_string();
         let payload_hex = hex::encode(serde_json::to_vec(&request).context("encode kv request")?);
         let body = json!({
