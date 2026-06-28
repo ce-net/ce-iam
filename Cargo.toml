@@ -22,13 +22,13 @@ repository = "https://github.com/ce-net/ce-iam"
 
 [workspace.dependencies]
 # CE substrate primitives (by path; ce-build mirrors the path layout onto the build node).
-ce-cap = { path = "../ce/crates/ce-cap" }
-ce-identity = { path = "../ce/crates/ce-identity" }
-ce-rs = { path = "../ce-rs" }
+ce-cap = { git = "https://github.com/ce-net/ce" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 # The coordination tier (replicated maps / state machines) the authenticated mesh KV is built on.
-ce-coord = { path = "../ce-coord" }
+ce-coord = { git = "https://github.com/ce-net/ce-coord" }
 # The byte-exact JS-vault interop primitives the secrets module is grown from.
-ce-secrets-rs = { path = "../ce-secrets-rs" }
+ce-secrets-rs = { git = "https://github.com/ce-net/ce-secrets-rs" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -46,7 +46,7 @@ proptest = "1"
 # these patches the git copies and our path copies are two distinct crates, so a `CeClient` from ce-rs
 # wouldn't type-check where ce-coord expects "its" `CeClient`. Redirect both onto our one path copy.
 [patch."https://github.com/ce-net/ce-rs"]
-ce-rs = { path = "../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
 
 [patch."https://github.com/ce-net/ce"]
-ce-identity = { path = "../ce/crates/ce-identity" }
+ce-identity = { git = "https://github.com/ce-net/ce" }
